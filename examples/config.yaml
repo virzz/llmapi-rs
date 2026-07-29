@@ -1,0 +1,15 @@
+server: 127.0.0.1:8080
+default: deepseek
+providers:
+  deepseek:
+    type: chat
+    baseurl: https://api.deepseek.com/v1
+    apikey: ${DEEPSEEK_API_KEY}
+  openai:
+    type: responses
+    baseurl: https://api.openai.com/v1
+    apikey: ${OPENAI_API_KEY}
+  anthropic:
+    type: messages
+    baseurl: https://api.anthropic.com/v1
+    apikey: ${ANTHROPIC_API_KEY}
