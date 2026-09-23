@@ -75,5 +75,6 @@ jobs:
           VERSION: ${{ github.ref_name }}
         run: |
           gh api repos/virzz/homebrew-enyo/dispatches \
-            -f event_type=update-llmapi-formula \
+            -f event_type=update-formula \
+            -f 'client_payload[formula]=llmapi' \
             -f "client_payload[version]=${VERSION}"
