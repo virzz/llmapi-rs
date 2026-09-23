@@ -10,7 +10,7 @@ use axum::{
     Json, Router,
 };
 use serde_json::json;
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 use tracing::{info, warn};
 
 use super::{config::Config, proxy, redact};
@@ -74,18 +74,81 @@ pub(crate) async fn serve_reloading(
 ) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     info!(target: "llmapi", address = %listener.local_addr()?, "server listening");
-    let listen_address = config.server.clone();
-    let (sender, receiver) = watch::channel(Arc::new(config));
-    let watcher = tokio::spawn(watch_config(
+    let mut listen_address = config.server.clone();
+    let (sender, mut receiver) = watch::channel(Arc::new(config));
+    let watcher = watch_config(
         path,
-        listen_address,
+        listen_address.clone(),
         server_override,
         default_override,
         sender,
-    ));
-    let result = axum::serve(listener, app_with_config(receiver)).await;
-    watcher.abort();
-    result?;
+    );
+    tokio::pin!(watcher);
+    let (mut shutdown, shutdown_receiver) = oneshot::channel();
+    let mut server = Box::pin(run_server(listener, receiver.clone(), shutdown_receiver));
+    let mut retry = tokio::time::interval(Duration::from_millis(500));
+    let mut last_bind_error = None;
+
+    loop {
+        tokio::select! {
+            result = &mut server => return result,
+            _ = &mut watcher => return Ok(()),
+            changed = receiver.changed() => {
+                if changed.is_err() {
+                    return Ok(());
+                }
+            }
+            _ = retry.tick() => {}
+        }
+        let requested_address = receiver.borrow().server.clone();
+        if requested_address == listen_address {
+            last_bind_error = None;
+            continue;
+        }
+        let listener = async {
+            let addr: SocketAddr = requested_address.parse()?;
+            Ok::<_, anyhow::Error>(tokio::net::TcpListener::bind(addr).await?)
+        }
+        .await;
+        let listener = match listener {
+            Ok(listener) => listener,
+            Err(err) => {
+                let message = err.to_string();
+                if last_bind_error.as_deref() != Some(message.as_str()) {
+                    warn!(target: "llmapi", address = %requested_address, error = %err, "listen address change failed; keeping previous listener");
+                    last_bind_error = Some(message);
+                }
+                continue;
+            }
+        };
+        last_bind_error = None;
+        info!(target: "llmapi", address = %listener.local_addr()?, "server listening");
+        let (next_shutdown, shutdown_receiver) = oneshot::channel();
+        let old_server = std::mem::replace(
+            &mut server,
+            Box::pin(run_server(listener, receiver.clone(), shutdown_receiver)),
+        );
+        tokio::spawn(async move {
+            if let Err(err) = old_server.await {
+                warn!(target: "llmapi", error = %err, "previous listener stopped with error");
+            }
+        });
+        let _ = shutdown.send(());
+        shutdown = next_shutdown;
+        listen_address = requested_address;
+    }
+}
+
+async fn run_server(
+    listener: tokio::net::TcpListener,
+    config: watch::Receiver<Arc<Config>>,
+    shutdown: oneshot::Receiver<()>,
+) -> Result<()> {
+    axum::serve(listener, app_with_config(config))
+        .with_graceful_shutdown(async {
+            let _ = shutdown.await;
+        })
+        .await?;
     Ok(())
 }
 
@@ -121,17 +184,14 @@ async fn watch_config(
             continue;
         }
         let config = Config::parse(&path, &body).and_then(|mut config| {
-                if let Some(default) = &default_override {
-                    config.set_default(default)?;
-                }
-                if config.server != listen_address {
-                    if !server_override {
-                        warn!(target: "llmapi", path = %path.display(), "listen address change requires restart");
-                    }
-                    config.server = listen_address.clone();
-                }
-                Ok(config)
-            });
+            if let Some(default) = &default_override {
+                config.set_default(default)?;
+            }
+            if server_override {
+                config.server = listen_address.clone();
+            }
+            Ok(config)
+        });
         last_body = Some(body);
         match config {
             Ok(config) => {
@@ -426,7 +486,7 @@ mod tests {
         let watcher = tokio::spawn(watch_config(
             path.clone(),
             config.server.clone(),
-            false,
+            true,
             None,
             sender,
         ));
@@ -493,22 +553,25 @@ mod tests {
         file_config.save(&path).unwrap();
         let mut active = file_config.clone();
         active.default = "openai".into();
+        active.server = "127.0.0.1:8081".into();
         let (sender, mut receiver) = watch::channel(Arc::new(active));
         let watcher = tokio::spawn(watch_config(
             path.clone(),
-            file_config.server.clone(),
-            false,
+            "127.0.0.1:8081".into(),
+            true,
             Some("openai".into()),
             sender,
         ));
 
         file_config.providers.get_mut("openai").unwrap().base_url = "https://second.test".into();
+        file_config.server = "127.0.0.1:9090".into();
         file_config.save(&path).unwrap();
         tokio::time::timeout(Duration::from_secs(3), receiver.changed())
             .await
             .unwrap()
             .unwrap();
         assert_eq!(receiver.borrow().default, "openai");
+        assert_eq!(receiver.borrow().server, "127.0.0.1:8081");
         assert_eq!(
             receiver.borrow().providers["openai"].base_url,
             "https://second.test"
@@ -523,6 +586,79 @@ mod tests {
         );
         assert!(receiver.borrow().providers.contains_key("openai"));
         watcher.abort();
+    }
+
+    #[tokio::test]
+    async fn reloads_listen_address_and_keeps_old_listener_on_bind_failure() {
+        let initial = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let first_address = initial.local_addr().unwrap();
+        drop(initial);
+        let mut config = test_config("https://example.test");
+        config.server = first_address.to_string();
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("config.yaml");
+        config.save(&path).unwrap();
+        let server = tokio::spawn(serve_reloading(
+            first_address,
+            config.clone(),
+            path.clone(),
+            false,
+            None,
+        ));
+        let client = reqwest::Client::new();
+        let first_url = format!("http://{first_address}/providers");
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if client.get(&first_url).send().await.is_ok() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let occupied = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let second_address = occupied.local_addr().unwrap();
+        config.server = second_address.to_string();
+        config.default = "openai".into();
+        config.save(&path).unwrap();
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        let still_first: Value = client
+            .get(&first_url)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(still_first["default"], "openai");
+        drop(occupied);
+
+        let second_url = format!("http://{second_address}/providers");
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Ok(response) = client.get(&second_url).send().await {
+                    let body: Value = response.json().await.unwrap();
+                    assert_eq!(body["default"], "openai");
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if tokio::net::TcpStream::connect(first_address).await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        server.abort();
     }
 
     #[tokio::test]
