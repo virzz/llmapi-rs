@@ -19,6 +19,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
+use comfy_table::Table;
 
 use config::{Config, Provider, ProviderConfig};
 
@@ -206,17 +207,17 @@ impl Cmd {
 }
 
 fn format_provider_list(config: &Config) -> String {
-    let mut output = String::from("NAME\tTYPE\tBASEURL\tDEFAULT\n");
+    let mut table = Table::new();
+    table.set_header(["NAME", "TYPE", "BASEURL", "DEFAULT"]);
     for (name, provider) in &config.providers {
-        output.push_str(&format!(
-            "{}\t{}\t{}\t{}\n",
-            name,
-            provider.provider_type,
-            provider.base_url,
-            if name == &config.default { "*" } else { "" }
-        ));
+        table.add_row([
+            name.as_str(),
+            provider.provider_type.as_str(),
+            provider.base_url.as_str(),
+            if name == &config.default { "*" } else { "" },
+        ]);
     }
-    output
+    format!("{table}\n")
 }
 
 #[cfg(test)]
@@ -414,7 +415,15 @@ mod tests {
 
         let output = format_provider_list(&config);
 
-        assert!(output.contains("deepseek\topenai-chat\thttps://api.deepseek.test\t*"));
+        assert!(output.contains("deepseek"));
+        assert!(output.contains("openai-chat"));
+        assert!(output.contains("https://api.deepseek.test"));
+        let row = output
+            .lines()
+            .find(|line| line.contains("| deepseek "))
+            .unwrap();
+        assert_eq!(row.rsplit('|').nth(1).unwrap().trim(), "*");
+        assert!(!output.contains('\t'));
         assert!(!output.contains("sk-secret"));
     }
 
