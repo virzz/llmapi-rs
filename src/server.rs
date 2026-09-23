@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::Result;
 use axum::{
@@ -8,6 +8,7 @@ use axum::{
     routing::any,
     Router,
 };
+use tokio::sync::watch;
 use tracing::{info, warn};
 
 use super::{config::Config, proxy, redact};
@@ -18,7 +19,18 @@ pub struct AppState {
     pub client: reqwest::Client,
 }
 
+#[derive(Clone)]
+struct ServerState {
+    config: watch::Receiver<Arc<Config>>,
+    client: reqwest::Client,
+}
+
 pub fn app(config: Config) -> Router {
+    let (_, config) = watch::channel(Arc::new(config));
+    app_with_config(config)
+}
+
+fn app_with_config(config: watch::Receiver<Arc<Config>>) -> Router {
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(15))
         .build()
@@ -26,10 +38,7 @@ pub fn app(config: Config) -> Router {
             warn!(target: "llmapi", error = %err, "failed to configure upstream client");
             reqwest::Client::new()
         });
-    let state = AppState {
-        config: Arc::new(config),
-        client,
-    };
+    let state = ServerState { config, client };
 
     Router::new()
         .route("/{*path}", any(handler))
@@ -43,8 +52,95 @@ pub async fn serve(addr: SocketAddr, config: Config) -> Result<()> {
     Ok(())
 }
 
+pub(crate) async fn serve_reloading(
+    addr: SocketAddr,
+    config: Config,
+    path: PathBuf,
+    server_override: bool,
+    default_override: Option<String>,
+) -> Result<()> {
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    info!(target: "llmapi", address = %listener.local_addr()?, "server listening");
+    let listen_address = config.server.clone();
+    let (sender, receiver) = watch::channel(Arc::new(config));
+    let watcher = tokio::spawn(watch_config(
+        path,
+        listen_address,
+        server_override,
+        default_override,
+        sender,
+    ));
+    let result = axum::serve(listener, app_with_config(receiver)).await;
+    watcher.abort();
+    result?;
+    Ok(())
+}
+
+async fn watch_config(
+    path: PathBuf,
+    listen_address: String,
+    server_override: bool,
+    default_override: Option<String>,
+    sender: watch::Sender<Arc<Config>>,
+) {
+    let mut interval = tokio::time::interval(Duration::from_millis(500));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last_body = None;
+    let mut last_error: Option<String> = None;
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {}
+            _ = sender.closed() => return,
+        }
+        let body = match tokio::fs::read_to_string(&path).await {
+            Ok(body) => body,
+            Err(err) => {
+                let message = err.to_string();
+                if last_error.as_deref() != Some(message.as_str()) {
+                    warn!(target: "llmapi", path = %path.display(), error = %err, "config reload failed; keeping previous config");
+                    last_error = Some(message);
+                }
+                last_body = None;
+                continue;
+            }
+        };
+        if last_body.as_ref() == Some(&body) {
+            continue;
+        }
+        let config = Config::parse(&path, &body).and_then(|mut config| {
+                if let Some(default) = &default_override {
+                    config.set_default(default)?;
+                }
+                if config.server != listen_address {
+                    if !server_override {
+                        warn!(target: "llmapi", path = %path.display(), "listen address change requires restart");
+                    }
+                    config.server = listen_address.clone();
+                }
+                Ok(config)
+            });
+        last_body = Some(body);
+        match config {
+            Ok(config) => {
+                last_error = None;
+                if **sender.borrow() != config {
+                    sender.send_replace(Arc::new(config));
+                    info!(target: "llmapi", path = %path.display(), "config reloaded");
+                }
+            }
+            Err(err) => {
+                let message = err.to_string();
+                if last_error.as_deref() != Some(message.as_str()) {
+                    warn!(target: "llmapi", path = %path.display(), error = %err, "config reload failed; keeping previous config");
+                    last_error = Some(message);
+                }
+            }
+        }
+    }
+}
+
 fn handler(
-    State(state): State<AppState>,
+    State(state): State<ServerState>,
     method: Method,
     uri: Uri,
     headers: HeaderMap,
@@ -61,12 +157,16 @@ fn handler(
         .body(body)
         .expect("request builder with existing uri");
 
-    proxy::handle(state, headers, request)
+    let snapshot = AppState {
+        config: state.config.borrow().clone(),
+        client: state.client.clone(),
+    };
+    proxy::handle(snapshot, headers, request)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, convert::Infallible, sync::Arc};
+    use std::{collections::BTreeMap, convert::Infallible, fs, sync::Arc};
 
     use axum::{
         body::Bytes,
@@ -77,6 +177,7 @@ mod tests {
         Json, Router,
     };
     use serde_json::{json, Value};
+    use tempfile::tempdir;
     use tokio::sync::Mutex;
 
     use super::*;
@@ -290,6 +391,143 @@ mod tests {
             axum::serve(proxy_listener, app(config)).await.unwrap();
         });
         address
+    }
+
+    #[tokio::test]
+    async fn reloads_valid_config_and_keeps_last_good_on_invalid_change() {
+        let (first_upstream, _) = start_upstream(json!({
+            "object": "list", "data": [{"id": "first", "object": "model"}]
+        }))
+        .await;
+        let (second_upstream, _) = start_upstream(json!({
+            "object": "list", "data": [{"id": "second", "object": "model"}]
+        }))
+        .await;
+        let mut config = test_config(&first_upstream);
+        config.providers.get_mut("openai").unwrap().base_url = second_upstream;
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("config.yaml");
+        config.save(&path).unwrap();
+
+        let (sender, mut receiver) = watch::channel(Arc::new(config.clone()));
+        let watcher = tokio::spawn(watch_config(
+            path.clone(),
+            config.server.clone(),
+            false,
+            None,
+            sender,
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server_receiver = receiver.clone();
+        tokio::spawn(async move {
+            axum::serve(listener, app_with_config(server_receiver))
+                .await
+                .unwrap();
+        });
+        let client = reqwest::Client::new();
+        let list_models = || client.get(format!("http://{address}/models"));
+
+        let first: Value = list_models().send().await.unwrap().json().await.unwrap();
+        assert_eq!(first["data"][0]["id"], "first");
+
+        config.default = "openai".into();
+        config.server = "127.0.0.1:9090".into();
+        config.save(&path).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), receiver.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(receiver.borrow().default, "openai");
+        assert_eq!(receiver.borrow().server, "127.0.0.1:0");
+        let second: Value = list_models().send().await.unwrap().json().await.unwrap();
+        assert_eq!(second["data"][0]["id"], "second");
+
+        fs::write(&path, "default: missing\nproviders: {}\n").unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(800), receiver.changed())
+                .await
+                .is_err()
+        );
+        let still_second: Value = list_models().send().await.unwrap().json().await.unwrap();
+        assert_eq!(still_second["data"][0]["id"], "second");
+
+        fs::remove_file(&path).unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(800), receiver.changed())
+                .await
+                .is_err()
+        );
+        let still_second: Value = list_models().send().await.unwrap().json().await.unwrap();
+        assert_eq!(still_second["data"][0]["id"], "second");
+
+        config.default = "deepseek".into();
+        config.save(&path).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), receiver.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        let first_again: Value = list_models().send().await.unwrap().json().await.unwrap();
+        assert_eq!(first_again["data"][0]["id"], "first");
+        watcher.abort();
+    }
+
+    #[tokio::test]
+    async fn reload_preserves_cli_default_override() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let mut file_config = test_config("https://first.test");
+        file_config.save(&path).unwrap();
+        let mut active = file_config.clone();
+        active.default = "openai".into();
+        let (sender, mut receiver) = watch::channel(Arc::new(active));
+        let watcher = tokio::spawn(watch_config(
+            path.clone(),
+            file_config.server.clone(),
+            false,
+            Some("openai".into()),
+            sender,
+        ));
+
+        file_config.providers.get_mut("openai").unwrap().base_url = "https://second.test".into();
+        file_config.save(&path).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), receiver.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(receiver.borrow().default, "openai");
+        assert_eq!(
+            receiver.borrow().providers["openai"].base_url,
+            "https://second.test"
+        );
+
+        file_config.providers.remove("openai");
+        file_config.save(&path).unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(800), receiver.changed())
+                .await
+                .is_err()
+        );
+        assert!(receiver.borrow().providers.contains_key("openai"));
+        watcher.abort();
+    }
+
+    #[tokio::test]
+    async fn config_watcher_stops_when_server_drops() {
+        let config = test_config("https://example.test");
+        let (sender, receiver) = watch::channel(Arc::new(config.clone()));
+        let watcher = tokio::spawn(watch_config(
+            PathBuf::from("missing.yaml"),
+            config.server,
+            false,
+            None,
+            sender,
+        ));
+        drop(receiver);
+        tokio::time::timeout(Duration::from_secs(1), watcher)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]

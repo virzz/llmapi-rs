@@ -159,13 +159,22 @@ impl Cmd {
     }
 
     async fn serve(&self, args: &ServerArgs) -> Result<()> {
-        let mut config = self.load_config()?;
+        let path = self.config_path();
+        let mut config =
+            Config::load(&path).with_context(|| format!("load config {}", path.display()))?;
         args.apply_to(&mut config)?;
         let addr: SocketAddr = config
             .server
             .parse()
             .context("parse server listen address")?;
-        server::serve(addr, config).await
+        server::serve_reloading(
+            addr,
+            config,
+            path,
+            args.server.is_some(),
+            args.default.clone(),
+        )
+        .await
     }
 
     pub async fn execute(&self) -> Result<()> {

@@ -87,9 +87,13 @@ impl Config {
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let path = path.as_ref();
         let body = fs::read_to_string(path)?;
+        Self::parse(path, &body)
+    }
+
+    pub(crate) fn parse(path: &Path, body: &str) -> Result<Self, ConfigError> {
         let mut config = match extension(path).as_deref() {
-            Some("yaml" | "yml") => serde_yaml::from_str::<Self>(&body)?,
-            Some("toml") => toml::from_str::<Self>(&body)?,
+            Some("yaml" | "yml") => serde_yaml::from_str::<Self>(body)?,
+            Some("toml") => toml::from_str::<Self>(body)?,
             Some(ext) => return Err(ConfigError::UnsupportedExtension(ext.to_string())),
             None => return Err(ConfigError::UnsupportedExtension(String::new())),
         };

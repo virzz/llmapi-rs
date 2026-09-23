@@ -17,6 +17,10 @@ Configuration is loaded from `--config <path>` when specified; otherwise from
 An explicitly selected file never falls back; `add` can create a new file there.
 The `server` command's `--server` and `--default` arguments override the selected
 file's listen address and default provider without modifying the file.
+While running, the server checks the selected file every 500 ms and applies valid
+provider/default changes to new requests. CLI overrides remain in effect. Invalid
+or missing files keep the last valid config; changing the listen address or the
+selected config path requires a restart.
 
 ## HTTP routes
 
