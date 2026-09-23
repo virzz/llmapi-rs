@@ -24,11 +24,11 @@ selected config path requires a restart.
 
 ## HTTP routes
 
-| Client protocol | Default provider | Named provider |
-| --- | --- | --- |
-| OpenAI Chat | `/chat/completions` | `/{provider}/chat/completions` |
-| OpenAI Responses | `/responses` | `/{provider}/responses` |
-| Anthropic Messages | `/messages` | `/{provider}/messages` |
+| Client protocol    | Default provider    | Named provider                 |
+| ------------------ | ------------------- | ------------------------------ |
+| OpenAI Chat        | `/chat/completions` | `/{provider}/chat/completions` |
+| OpenAI Responses   | `/responses`        | `/{provider}/responses`        |
+| Anthropic Messages | `/messages`         | `/{provider}/messages`         |
 
 `GET /models` and `GET /v1/models` (also under `/{provider}`) accept upstream
 OpenAI `data` or Codex `models` lists. Codex requests (identified by
