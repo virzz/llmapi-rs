@@ -35,6 +35,10 @@ OpenAI `data` or Codex `models` lists. Codex requests (identified by
 `client_version` or a Codex User-Agent) receive `models`; other clients receive
 OpenAI `data`. Missing metadata is synthesized when converting between formats.
 
+`GET /providers` returns the active default and all configured providers. Each
+configured `apikey` is returned as `***`; unset keys are omitted. The endpoint
+does not resolve environment variables or contact upstream providers.
+
 See [examples/config.yaml](examples/config.yaml) for the provider configuration format.
 
 ## Development

@@ -5,9 +5,11 @@ use axum::{
     body::Body,
     extract::State,
     http::{HeaderMap, Method, Request, Response, Uri},
-    routing::any,
-    Router,
+    response::IntoResponse,
+    routing::{any, get},
+    Json, Router,
 };
+use serde_json::json;
 use tokio::sync::watch;
 use tracing::{info, warn};
 
@@ -41,8 +43,19 @@ fn app_with_config(config: watch::Receiver<Arc<Config>>) -> Router {
     let state = ServerState { config, client };
 
     Router::new()
+        .route("/providers", get(providers))
         .route("/{*path}", any(handler))
         .with_state(state)
+}
+
+async fn providers(State(state): State<ServerState>) -> impl IntoResponse {
+    let mut config = state.config.borrow().as_ref().clone();
+    for provider in config.providers.values_mut() {
+        if provider.api_key.is_some() {
+            provider.api_key = Some("***".into());
+        }
+    }
+    Json(json!({"default": config.default, "providers": config.providers}))
 }
 
 pub async fn serve(addr: SocketAddr, config: Config) -> Result<()> {
@@ -680,6 +693,39 @@ mod tests {
 
         assert_eq!(unknown_route.status(), reqwest::StatusCode::NOT_FOUND);
         assert_eq!(unknown_provider.status(), reqwest::StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn providers_lists_active_config_without_exposing_api_keys() {
+        let mut config = test_config("https://example.test");
+        config.providers.get_mut("openai").unwrap().api_key = Some("${OPENAI_API_KEY}".into());
+        config.providers.get_mut("anthropic").unwrap().api_key = None;
+        let proxy = start_proxy(config).await;
+
+        let response = reqwest::get(format!("http://{proxy}/providers"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["default"], "deepseek");
+        assert_eq!(body["providers"].as_object().unwrap().len(), 3);
+        assert_eq!(
+            body["providers"]["deepseek"],
+            json!({
+                "type": "openai-chat", "baseurl": "https://example.test", "apikey": "***"
+            })
+        );
+        assert_eq!(body["providers"]["openai"]["apikey"], "***");
+        assert!(body["providers"]["anthropic"].get("apikey").is_none());
+        assert!(!body.to_string().contains("sk-deepseek"));
+        assert!(!body.to_string().contains("OPENAI_API_KEY"));
+
+        let response = reqwest::Client::new()
+            .post(format!("http://{proxy}/providers"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::METHOD_NOT_ALLOWED);
     }
 
     #[tokio::test]
