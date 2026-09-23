@@ -33,6 +33,8 @@ enum DaemonCommand {
     Uninstall,
     /// Load or restart the LaunchAgent
     Start,
+    /// Reload the LaunchAgent plist and restart the service
+    Restart,
     /// Unload the LaunchAgent
     Stop,
     /// Print the launchctl service status
@@ -70,22 +72,58 @@ impl DaemonArgs {
                     plist.display()
                 );
                 let service = service_target()?;
-                if launchctl(&["print", &service])?.status.success() {
+                let output = launchctl(&["print", &service])?;
+                if output.status.success() {
                     run_launchctl(&["kickstart", "-k", &service])
-                } else {
+                } else if service_not_found(&output.stderr) {
                     run_launchctl(&["bootstrap", &domain_target()?, path_text(&plist)?])
+                } else {
+                    bail!(
+                        "launchctl print failed: {}",
+                        String::from_utf8_lossy(&output.stderr).trim()
+                    )
                 }
+            }
+            DaemonCommand::Restart => {
+                ensure!(
+                    plist.is_file(),
+                    "LaunchAgent is not installed: {}",
+                    plist.display()
+                );
+                let service = service_target()?;
+                let output = launchctl(&["print", &service])?;
+                if output.status.success() {
+                    run_launchctl(&["bootout", &service])?;
+                } else if !service_not_found(&output.stderr) {
+                    bail!(
+                        "launchctl print failed: {}",
+                        String::from_utf8_lossy(&output.stderr).trim()
+                    );
+                }
+                run_launchctl(&["bootstrap", &domain_target()?, path_text(&plist)?])
             }
             DaemonCommand::Stop => run_launchctl(&["bootout", &service_target()?]),
             DaemonCommand::Status => {
                 let output = launchctl(&["print", &service_target()?])?;
-                ensure!(
-                    output.status.success(),
-                    "launchctl print failed: {}",
-                    String::from_utf8_lossy(&output.stderr).trim()
-                );
-                print!("{}", String::from_utf8_lossy(&output.stdout));
-                Ok(())
+                if output.status.success() {
+                    print!("{}", String::from_utf8_lossy(&output.stdout));
+                    Ok(())
+                } else if service_not_found(&output.stderr) {
+                    println!(
+                        "{}",
+                        if plist.is_file() {
+                            "not loaded"
+                        } else {
+                            "not installed"
+                        }
+                    );
+                    Ok(())
+                } else {
+                    bail!(
+                        "launchctl print failed: {}",
+                        String::from_utf8_lossy(&output.stderr).trim()
+                    )
+                }
             }
         }
     }
@@ -205,6 +243,11 @@ fn launchctl(args: &[&str]) -> Result<std::process::Output> {
         .with_context(|| format!("run launchctl {}", args.join(" ")))
 }
 
+fn service_not_found(stderr: &[u8]) -> bool {
+    String::from_utf8_lossy(stderr)
+        .contains(&format!("Could not find service \"{LABEL}\" in domain"))
+}
+
 fn run_launchctl(args: &[&str]) -> Result<()> {
     let output = launchctl(args)?;
     ensure!(
@@ -221,6 +264,15 @@ mod tests {
     use super::*;
     use clap::Parser;
     use tempfile::tempdir;
+
+    #[test]
+    fn recognizes_only_missing_service_errors() {
+        assert!(service_not_found(b"Bad request.\nCould not find service \"com.virzz.enyo.llmapi\" in domain for user gui: 501"));
+        assert!(!service_not_found(b"Permission denied"));
+        assert!(!service_not_found(
+            b"Could not find service \"other\" in domain"
+        ));
+    }
 
     #[test]
     fn parses_install_arguments() {
@@ -246,6 +298,14 @@ mod tests {
         assert_eq!(args, ["server", "--config", "config.yaml"]);
         assert!(command.config.is_none());
         assert!(crate::Cmd::try_parse_from(["llmapi", "daemon", "remove"]).is_ok());
+        assert!(matches!(
+            crate::Cmd::try_parse_from(["llmapi", "daemon", "restart"])
+                .unwrap()
+                .command,
+            crate::Command::Daemon(DaemonArgs {
+                command: DaemonCommand::Restart
+            })
+        ));
     }
 
     #[test]
