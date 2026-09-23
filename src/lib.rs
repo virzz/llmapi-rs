@@ -100,8 +100,19 @@ impl ServerArgs {
 impl Cmd {
     fn default_config_path() -> PathBuf {
         dirs::home_dir()
-            .map(|home| home.join(".config/enyo/llmapi.yaml"))
+            .map(|home| Self::default_config_path_in(&home))
             .unwrap_or_else(|| PathBuf::from(".config/enyo/llmapi.yaml"))
+    }
+
+    fn default_config_path_in(home: &Path) -> PathBuf {
+        let directory = home.join(".config/enyo");
+        for name in ["llmapi.yaml", "llmapi.toml", "llmapi.yml", "llmapi.json"] {
+            let path = directory.join(name);
+            if path.is_file() {
+                return path;
+            }
+        }
+        directory.join("llmapi.yaml")
     }
 
     fn config_path(&self) -> PathBuf {
@@ -112,7 +123,7 @@ impl Cmd {
         if let Some(path) = &self.config {
             return path.clone();
         }
-        for name in ["config.toml", "config.yaml"] {
+        for name in ["config.toml", "config.yaml", "config.yml", "config.json"] {
             let path = directory.join(name);
             if path.is_file() {
                 return path;
@@ -215,16 +226,49 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn default_config_path_points_to_yaml() {
-        assert!(Cmd::default_config_path().ends_with(".config/enyo/llmapi.yaml"));
+    fn default_config_path_supports_all_formats() {
+        let dir = tempdir().unwrap();
+        let directory = dir.path().join(".config/enyo");
+        fs::create_dir_all(&directory).unwrap();
+        assert_eq!(
+            Cmd::default_config_path_in(dir.path()),
+            directory.join("llmapi.yaml")
+        );
+        for name in ["llmapi.json", "llmapi.yml", "llmapi.toml", "llmapi.yaml"] {
+            fs::write(directory.join(name), "").unwrap();
+            assert_eq!(
+                Cmd::default_config_path_in(dir.path()),
+                directory.join(name)
+            );
+        }
     }
 
     #[test]
-    fn config_path_prefers_explicit_then_local_toml_then_yaml_then_default() {
+    fn config_path_prefers_explicit_then_local_formats_then_home() {
         let dir = tempdir().unwrap();
         let directory = dir.path();
         let cmd = Cmd::parse_from(["llmapi", "list"]);
         assert_eq!(cmd.config_path_in(directory), Cmd::default_config_path());
+
+        for (name, body, expected) in [
+            (
+                "config.json",
+                r#"{"default":"json","providers":{"json":{"type":"chat","baseurl":"https://json.test"}}}"#,
+                "json",
+            ),
+            (
+                "config.yml",
+                "default: yml\nproviders:\n  yml:\n    type: chat\n    baseurl: https://yml.test\n",
+                "yml",
+            ),
+        ] {
+            fs::write(directory.join(name), body).unwrap();
+            assert_eq!(cmd.config_path_in(directory), directory.join(name));
+            assert_eq!(
+                Config::load(cmd.config_path_in(directory)).unwrap().default,
+                expected
+            );
+        }
 
         fs::write(
             directory.join("config.yaml"),

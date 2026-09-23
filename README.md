@@ -23,7 +23,9 @@ files; use `daemon start` or `daemon stop` to change launchctl state. `remove`
 is an alias for `uninstall`; neither command deletes logs.
 
 Configuration is loaded from `--config <path>` when specified; otherwise from
-`./config.toml`, then `./config.yaml`, then `~/.config/enyo/llmapi.yaml`.
+`./config.{toml,yaml,yml,json}` in that order, then
+`~/.config/enyo/llmapi.{yaml,toml,yml,json}` in that order. When none exists,
+the fallback path is `~/.config/enyo/llmapi.yaml`.
 An explicitly selected file never falls back; `add` can create a new file there.
 The `server` command's `--server` and `--default` arguments override the selected
 file's listen address and default provider without modifying the file.

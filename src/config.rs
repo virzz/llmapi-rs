@@ -51,6 +51,8 @@ pub enum ConfigError {
     Yaml(#[from] serde_yaml::Error),
     #[error("parse toml config: {0}")]
     Toml(#[from] toml::de::Error),
+    #[error("json config: {0}")]
+    Json(#[from] serde_json::Error),
     #[error("serialize toml config: {0}")]
     TomlSerialize(#[from] toml::ser::Error),
     #[error("unsupported config extension: {0}")]
@@ -94,6 +96,7 @@ impl Config {
         let mut config = match extension(path).as_deref() {
             Some("yaml" | "yml") => serde_yaml::from_str::<Self>(body)?,
             Some("toml") => toml::from_str::<Self>(body)?,
+            Some("json") => serde_json::from_str::<Self>(body)?,
             Some(ext) => return Err(ConfigError::UnsupportedExtension(ext.to_string())),
             None => return Err(ConfigError::UnsupportedExtension(String::new())),
         };
@@ -118,6 +121,7 @@ impl Config {
         let body = match extension(path).as_deref() {
             Some("yaml" | "yml") => serde_yaml::to_string(self)?,
             Some("toml") => toml::to_string_pretty(self)?,
+            Some("json") => serde_json::to_string_pretty(self)?,
             Some(ext) => return Err(ConfigError::UnsupportedExtension(ext.to_string())),
             None => return Err(ConfigError::UnsupportedExtension(String::new())),
         };
@@ -311,37 +315,39 @@ providers:
     #[test]
     fn add_and_set_default_round_trip() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("llmapi.yaml");
-        let mut config = Config::load_for_update(&path).unwrap();
-        config
-            .add_provider(
-                "deepseek".into(),
-                ProviderConfig {
-                    provider_type: Provider::OpenAiChat,
-                    base_url: "https://api.deepseek.test/".into(),
-                    api_key: Some("sk-test".into()),
-                },
-            )
-            .unwrap();
-        config
-            .add_provider(
-                "openai".into(),
-                ProviderConfig {
-                    provider_type: Provider::OpenAiResponses,
-                    base_url: "https://api.openai.test".into(),
-                    api_key: None,
-                },
-            )
-            .unwrap();
-        config.set_default("openai").unwrap();
-        config.save(&path).unwrap();
+        for extension in ["yaml", "yml", "toml", "json"] {
+            let path = dir.path().join(format!("llmapi.{extension}"));
+            let mut config = Config::load_for_update(&path).unwrap();
+            config
+                .add_provider(
+                    "deepseek".into(),
+                    ProviderConfig {
+                        provider_type: Provider::OpenAiChat,
+                        base_url: "https://api.deepseek.test/".into(),
+                        api_key: Some("sk-test".into()),
+                    },
+                )
+                .unwrap();
+            config
+                .add_provider(
+                    "openai".into(),
+                    ProviderConfig {
+                        provider_type: Provider::OpenAiResponses,
+                        base_url: "https://api.openai.test".into(),
+                        api_key: None,
+                    },
+                )
+                .unwrap();
+            config.set_default("openai").unwrap();
+            config.save(&path).unwrap();
 
-        let loaded = Config::load(path).unwrap();
-        assert_eq!(loaded.default, "openai");
-        assert_eq!(
-            loaded.providers["deepseek"].base_url,
-            "https://api.deepseek.test"
-        );
+            let loaded = Config::load(path).unwrap();
+            assert_eq!(loaded.default, "openai");
+            assert_eq!(
+                loaded.providers["deepseek"].base_url,
+                "https://api.deepseek.test"
+            );
+        }
     }
 
     #[test]
