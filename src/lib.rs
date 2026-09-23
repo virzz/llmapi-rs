@@ -3,6 +3,8 @@
 pub mod adapters;
 pub mod auth;
 pub mod config;
+#[cfg(target_os = "macos")]
+pub mod daemon;
 pub mod model;
 mod models;
 pub mod protocol;
@@ -41,6 +43,9 @@ enum Command {
     Set(SetArgs),
     /// Start the HTTP server
     Server(ServerArgs),
+    /// Manage the macOS LaunchAgent
+    #[cfg(target_os = "macos")]
+    Daemon(daemon::DaemonArgs),
 }
 
 #[derive(Debug, Args)]
@@ -183,6 +188,8 @@ impl Cmd {
             Command::Add(args) => self.add(args),
             Command::Set(args) => self.set(args),
             Command::Server(args) => self.serve(args).await,
+            #[cfg(target_os = "macos")]
+            Command::Daemon(args) => args.execute(),
         }
     }
 }

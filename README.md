@@ -10,7 +10,17 @@ llmapi list
 llmapi add <name> --type <chat|responses|messages> --baseurl <url> [--apikey <key>]
 llmapi set default <provider>
 llmapi server [--server 127.0.0.1:8080] [--default <provider>]
+llmapi daemon install [--workdir <path>] [--args server ...]
+llmapi daemon start|stop|status|uninstall|remove
 ```
+
+On macOS, `daemon install` writes a user LaunchAgent to
+`~/Library/LaunchAgents/com.virzz.enyo.llmapi.plist`. The default working
+directory is the current directory and the default argument is `server`.
+`--args` replaces the full argument list. Logs go to
+`~/Library/Logs/com.virzz.enyo.llmapi/`. Installation and removal only change
+files; use `daemon start` or `daemon stop` to change launchctl state. `remove`
+is an alias for `uninstall`; neither command deletes logs.
 
 Configuration is loaded from `--config <path>` when specified; otherwise from
 `./config.toml`, then `./config.yaml`, then `~/.config/enyo/llmapi.yaml`.
