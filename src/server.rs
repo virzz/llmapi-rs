@@ -69,6 +69,7 @@ mod tests {
     use std::{collections::BTreeMap, convert::Infallible, sync::Arc};
 
     use axum::{
+        body::Bytes,
         extract::State,
         http::{HeaderMap, Method, StatusCode},
         response::IntoResponse,
@@ -113,8 +114,13 @@ mod tests {
         method: Method,
         uri: Uri,
         headers: HeaderMap,
-        Json(body): Json<Value>,
+        body: Bytes,
     ) -> impl IntoResponse {
+        let body = if body.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&body).unwrap()
+        };
         *recorded.request.lock().await = Some(CapturedRequest {
             method,
             uri,
@@ -424,7 +430,7 @@ mod tests {
         let (upstream, _) = start_upstream(json!({})).await;
         let proxy = start_proxy(test_config(&upstream)).await;
 
-        let unknown_route = reqwest::get(format!("http://{proxy}/models"))
+        let unknown_route = reqwest::get(format!("http://{proxy}/unknown"))
             .await
             .unwrap();
         let unknown_provider = reqwest::Client::new()
@@ -436,6 +442,189 @@ mod tests {
 
         assert_eq!(unknown_route.status(), reqwest::StatusCode::NOT_FOUND);
         assert_eq!(unknown_provider.status(), reqwest::StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn model_routes_return_client_response_shape() {
+        let data = json!({
+            "object": "list",
+            "data": [{"created": 1790035200, "id": "gpt-6-sol", "object": "model", "owned_by": "openai"}]
+        });
+        let models = json!({
+            "models": [{
+                "slug": "gpt-6-sol",
+                "display_name": "GPT 6.0 Sol",
+                "default_reasoning_level": "medium",
+                "supported_reasoning_levels": [{"effort": "low", "description": "Fast responses"}],
+                "context_window": 272000,
+                "available_access_programs": {"cyber": ["standard"]}
+            }]
+        });
+        for (path, payload, api_key, base_suffix, codex) in [
+            ("/models", &data, "sk-deepseek", "", false),
+            ("/v1/models", &models, "sk-deepseek", "/v1", true),
+            ("/openai/models", &models, "sk-openai", "", false),
+            ("/openai/v1/models", &data, "sk-openai", "/v1", true),
+            ("/models", &models, "sk-deepseek", "", true),
+            ("/v1/models", &data, "sk-deepseek", "/v1", false),
+        ] {
+            let (upstream, captured) = start_upstream(payload.clone()).await;
+            let proxy = start_proxy(test_config(&format!("{upstream}{base_suffix}"))).await;
+            let query = if codex {
+                "limit=10&key=sk-client&client_version=1.2.3"
+            } else {
+                "limit=10&key=sk-client"
+            };
+            let response = reqwest::get(format!("http://{proxy}{path}?{query}"))
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+            assert!(response
+                .headers()
+                .get_all("vary")
+                .iter()
+                .any(|value| value == "User-Agent"));
+            let output: Value = response.json().await.unwrap();
+            if codex {
+                assert!(output["models"].is_array(), "{path}");
+                assert_eq!(output["models"][0]["slug"], "gpt-6-sol");
+                assert!(output.get("data").is_none());
+                if payload.get("models").is_some() {
+                    assert_eq!(output, *payload);
+                } else {
+                    assert_eq!(output["models"][0]["base_instructions"], "");
+                }
+            } else {
+                assert_eq!(output["object"], "list");
+                assert_eq!(output["data"][0]["id"], "gpt-6-sol");
+                assert!(output.get("models").is_none());
+                if payload.get("data").is_some() {
+                    assert_eq!(output, *payload);
+                }
+            }
+            let request = captured.lock().await;
+            let request = request.as_ref().unwrap();
+            assert_eq!(request.method, Method::GET, "{path}");
+            assert_eq!(
+                request.uri.path(),
+                format!("{base_suffix}/models"),
+                "{path}"
+            );
+            let forwarded_query = if codex {
+                "limit=10&client_version=1.2.3"
+            } else {
+                "limit=10"
+            };
+            assert_eq!(request.uri.query(), Some(forwarded_query), "{path}");
+            assert_eq!(
+                request.headers["authorization"],
+                format!("Bearer {api_key}")
+            );
+            assert_eq!(request.body, Value::Null);
+        }
+    }
+
+    #[tokio::test]
+    async fn models_rejects_post_without_calling_upstream() {
+        let (upstream, captured) = start_upstream(json!({"data": []})).await;
+        let proxy = start_proxy(test_config(&upstream)).await;
+
+        let response = reqwest::Client::new()
+            .post(format!("http://{proxy}/models"))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(
+            response.json::<Value>().await.unwrap()["error"]["type"],
+            "invalid_request_error"
+        );
+        assert!(captured.lock().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn codex_user_agent_selects_models_without_version_query() {
+        let (upstream, captured) = start_upstream(json!({
+            "object": "list",
+            "data": [{"id": "gpt-6-sol", "object": "model", "created": 1790035200, "owned_by": "openai"}]
+        }))
+        .await;
+        let proxy = start_proxy(test_config(&upstream)).await;
+
+        let response = reqwest::Client::new()
+            .get(format!("http://{proxy}/models"))
+            .header("user-agent", "codex_cli_rs/1.0")
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.json::<Value>().await.unwrap()["models"][0]["slug"],
+            "gpt-6-sol"
+        );
+        assert_eq!(
+            captured.lock().await.as_ref().unwrap().uri.path(),
+            "/models"
+        );
+    }
+
+    #[tokio::test]
+    async fn models_preserves_conditional_etag_response() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route(
+                    "/models",
+                    any(|headers: HeaderMap| async move {
+                        assert_eq!(headers["if-none-match"], "\"catalog-v1\"");
+                        Response::builder()
+                            .status(StatusCode::NOT_MODIFIED)
+                            .header("etag", "\"catalog-v1\"")
+                            .body(Body::empty())
+                            .unwrap()
+                    }),
+                ),
+            )
+            .await
+            .unwrap();
+        });
+        let proxy = start_proxy(test_config(&upstream)).await;
+
+        let response = reqwest::Client::new()
+            .get(format!("http://{proxy}/models?client_version=1.0"))
+            .header("if-none-match", "\"catalog-v1\"")
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(response.headers()["etag"], "\"catalog-v1\"");
+        assert!(response
+            .headers()
+            .get_all("vary")
+            .iter()
+            .any(|value| value == "User-Agent"));
+    }
+
+    #[tokio::test]
+    async fn models_rejects_malformed_success_response() {
+        let (upstream, _) = start_upstream(json!({"error": "not a catalog"})).await;
+        let proxy = start_proxy(test_config(&upstream)).await;
+
+        let response = reqwest::get(format!("http://{proxy}/models?client_version=1.0"))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            response.json::<Value>().await.unwrap()["error"]["type"],
+            "api_error"
+        );
     }
 
     #[tokio::test]

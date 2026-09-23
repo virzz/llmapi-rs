@@ -5,6 +5,7 @@ pub enum InputFormat {
     OpenAiChat,
     OpenAiResponses,
     AnthropicMessages,
+    Models,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,6 +44,7 @@ fn detect_endpoint(path: &str) -> Option<InputFormat> {
         "/chat/completions" | "/v1/chat/completions" => Some(InputFormat::OpenAiChat),
         "/responses" | "/v1/responses" => Some(InputFormat::OpenAiResponses),
         "/messages" | "/v1/messages" => Some(InputFormat::AnthropicMessages),
+        "/models" | "/v1/models" => Some(InputFormat::Models),
         _ => None,
     }
 }
@@ -117,9 +119,29 @@ mod tests {
 
     #[test]
     fn rejects_unknown_routes() {
-        assert_eq!(detect_route("/models"), None);
-        assert_eq!(detect_route("/openai/models"), None);
         assert_eq!(detect_route("/too/many/responses"), None);
+    }
+
+    #[test]
+    fn detects_model_routes() {
+        for path in ["/models", "/v1/models"] {
+            assert_eq!(
+                detect_route(path),
+                Some(Route {
+                    provider: None,
+                    input: InputFormat::Models,
+                })
+            );
+        }
+        for path in ["/openai/models", "/openai/v1/models"] {
+            assert_eq!(
+                detect_route(path),
+                Some(Route {
+                    provider: Some("openai".into()),
+                    input: InputFormat::Models,
+                })
+            );
+        }
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use axum::{
     body::{to_bytes, Body},
-    http::{header, HeaderMap, Method, Response, StatusCode},
+    http::{header, HeaderMap, HeaderValue, Method, Response, StatusCode},
 };
 use bytes::{Bytes, BytesMut};
 use futures_util::{FutureExt, StreamExt};
@@ -16,6 +16,7 @@ use super::{
     auth,
     config::{Provider, ProviderConfig},
     model::{LLMRequest, LLMResponse},
+    models,
     protocol::{detect_route, is_transparent, upstream_for, InputFormat, UpstreamFormat},
     redact,
     server::AppState,
@@ -52,11 +53,20 @@ pub async fn handle(
             "text/plain",
         );
     };
-    if method != Method::POST {
+    let expected_method = if route.input == InputFormat::Models {
+        Method::GET
+    } else {
+        Method::POST
+    };
+    if method != expected_method {
         return protocol_error_response(
             &route.input,
             StatusCode::METHOD_NOT_ALLOWED,
-            "llmapi endpoints require POST",
+            if expected_method == Method::GET {
+                "llmapi models endpoint requires GET"
+            } else {
+                "llmapi endpoints require POST"
+            },
             "invalid_request_error",
         );
     }
@@ -82,6 +92,29 @@ pub async fn handle(
             );
         }
     };
+    if route.input == InputFormat::Models {
+        let codex_client = models::is_codex_client(&headers, query.as_deref());
+        let url = upstream_url(&provider.base_url, "/models", query.as_deref());
+        return match send_upstream_request(
+            state,
+            provider,
+            &headers,
+            Method::GET,
+            query.as_deref(),
+            &url,
+            Bytes::new(),
+        )
+        .await
+        {
+            Ok(upstream) => models_response(upstream, codex_client).await,
+            Err(err) => protocol_error_response(
+                &route.input,
+                StatusCode::BAD_GATEWAY,
+                &err.to_string(),
+                "api_error",
+            ),
+        };
+    }
     let body = match to_bytes(request.into_body(), MAX_JSON_BODY_BYTES).await {
         Ok(body) => body,
         Err(err) => {
@@ -123,6 +156,79 @@ pub async fn handle(
         upstream_raw,
     })
     .await
+}
+
+async fn models_response(upstream: reqwest::Response, codex_client: bool) -> Response<Body> {
+    if !upstream.status().is_success() {
+        let mut response = raw_upstream_response(upstream);
+        response
+            .headers_mut()
+            .append(header::VARY, HeaderValue::from_static("User-Agent"));
+        return response;
+    }
+    let status = upstream.status();
+    let headers = upstream.headers().clone();
+    let body = match read_upstream_body(upstream, MAX_JSON_BODY_BYTES).await {
+        Ok(body) => body,
+        Err(err) => {
+            return protocol_error_response(
+                &InputFormat::Models,
+                StatusCode::BAD_GATEWAY,
+                &err,
+                "api_error",
+            )
+        }
+    };
+    let value: Value = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(err) => {
+            return protocol_error_response(
+                &InputFormat::Models,
+                StatusCode::BAD_GATEWAY,
+                &err.to_string(),
+                "api_error",
+            )
+        }
+    };
+    let (desired_key, other_key) = if codex_client {
+        ("models", "data")
+    } else {
+        ("data", "models")
+    };
+    let native = value.get(desired_key).and_then(Value::as_array).is_some()
+        && value.get(other_key).is_none();
+    if native {
+        let mut response = response(status, body, "application/json");
+        copy_response_metadata_headers(&headers, response.headers_mut());
+        if let Some(etag) = headers.get(header::ETAG) {
+            response.headers_mut().insert(header::ETAG, etag.clone());
+        }
+        response
+            .headers_mut()
+            .append(header::VARY, HeaderValue::from_static("User-Agent"));
+        return response;
+    }
+    let output = match models::for_client(value, codex_client) {
+        Ok(output) => output,
+        Err(err) => {
+            return protocol_error_response(
+                &InputFormat::Models,
+                StatusCode::BAD_GATEWAY,
+                err,
+                "api_error",
+            )
+        }
+    };
+    let mut response = response(
+        status,
+        Bytes::from(serde_json::to_vec(&output).unwrap()),
+        "application/json",
+    );
+    copy_response_metadata_headers(&headers, response.headers_mut());
+    response
+        .headers_mut()
+        .append(header::VARY, HeaderValue::from_static("User-Agent"));
+    response
 }
 
 pub fn forward_raw(
@@ -184,6 +290,11 @@ fn send_upstream_request(
         extracted.as_deref(),
     );
     auth::apply_protocol_headers(&mut upstream_headers, provider.provider_type, headers);
+    if method == Method::GET {
+        if let Some(etag) = headers.get(header::IF_NONE_MATCH) {
+            upstream_headers.insert(header::IF_NONE_MATCH, etag.clone());
+        }
+    }
     state
         .client
         .request(method, url)
@@ -286,6 +397,7 @@ fn input_to_llm(input: &InputFormat, value: Value) -> Result<LLMRequest, Adapter
         InputFormat::OpenAiChat => OpenAiChatAdapter::to_llm_request(value),
         InputFormat::OpenAiResponses => OpenAiResponsesAdapter::to_llm_request(value),
         InputFormat::AnthropicMessages => AnthropicAdapter::to_llm_request(value),
+        InputFormat::Models => unreachable!("models requests are forwarded before conversion"),
     }
 }
 
@@ -481,7 +593,7 @@ fn protocol_error_response(
             "type": "error",
             "error": {"type": error_type, "message": message}
         }),
-        InputFormat::OpenAiChat | InputFormat::OpenAiResponses => json!({
+        InputFormat::OpenAiChat | InputFormat::OpenAiResponses | InputFormat::Models => json!({
             "error": {"message": message, "type": error_type, "param": null, "code": null}
         }),
     };
@@ -497,6 +609,8 @@ fn copy_response_headers(source: &HeaderMap, target: &mut HeaderMap) {
         let name_text = name.as_str();
         if name == header::CONTENT_TYPE
             || name == header::CACHE_CONTROL
+            || name == header::ETAG
+            || name == header::VARY
             || name == header::RETRY_AFTER
             || matches!(
                 name_text,
@@ -513,6 +627,7 @@ fn copy_response_metadata_headers(source: &HeaderMap, target: &mut HeaderMap) {
     for (name, value) in source {
         let name_text = name.as_str();
         if name == header::CACHE_CONTROL
+            || name == header::VARY
             || name == header::RETRY_AFTER
             || matches!(
                 name_text,
@@ -538,6 +653,7 @@ fn llm_to_input(input: &InputFormat, response: &LLMResponse) -> Result<Value, Ad
         InputFormat::OpenAiChat => OpenAiChatAdapter::from_llm_response(response),
         InputFormat::OpenAiResponses => OpenAiResponsesAdapter::from_llm_response(response),
         InputFormat::AnthropicMessages => AnthropicAdapter::from_llm_response(response),
+        InputFormat::Models => unreachable!("models responses are forwarded before conversion"),
     }
 }
 
@@ -562,6 +678,7 @@ fn format_stream_events(
         InputFormat::OpenAiChat => OpenAiChatAdapter::format_stream_events(events, state),
         InputFormat::OpenAiResponses => OpenAiResponsesAdapter::format_stream_events(events, state),
         InputFormat::AnthropicMessages => AnthropicAdapter::format_stream_events(events, state),
+        InputFormat::Models => unreachable!("models responses are forwarded before conversion"),
     }
 }
 

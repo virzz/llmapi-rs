@@ -4,12 +4,16 @@ pub mod adapters;
 pub mod auth;
 pub mod config;
 pub mod model;
+mod models;
 pub mod protocol;
 pub mod proxy;
 mod redact;
 pub mod server;
 
-use std::{net::SocketAddr, path::PathBuf};
+use std::{
+    net::SocketAddr,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
@@ -71,6 +75,21 @@ struct ServerArgs {
     /// Override the server listen address from the config file
     #[arg(long)]
     server: Option<String>,
+    /// Override the default provider from the config file
+    #[arg(long)]
+    default: Option<String>,
+}
+
+impl ServerArgs {
+    fn apply_to(&self, config: &mut Config) -> Result<()> {
+        if let Some(default) = &self.default {
+            config.set_default(default)?;
+        }
+        if let Some(server) = &self.server {
+            config.server = server.clone();
+        }
+        Ok(())
+    }
 }
 
 impl Cmd {
@@ -81,9 +100,20 @@ impl Cmd {
     }
 
     fn config_path(&self) -> PathBuf {
-        self.config
-            .clone()
-            .unwrap_or_else(Self::default_config_path)
+        self.config_path_in(Path::new("."))
+    }
+
+    fn config_path_in(&self, directory: &Path) -> PathBuf {
+        if let Some(path) = &self.config {
+            return path.clone();
+        }
+        for name in ["config.toml", "config.yaml"] {
+            let path = directory.join(name);
+            if path.is_file() {
+                return path;
+            }
+        }
+        Self::default_config_path()
     }
 
     fn list(&self) -> Result<()> {
@@ -130,9 +160,7 @@ impl Cmd {
 
     async fn serve(&self, args: &ServerArgs) -> Result<()> {
         let mut config = self.load_config()?;
-        if let Some(server) = &args.server {
-            config.server = server.clone();
-        }
+        args.apply_to(&mut config)?;
         let addr: SocketAddr = config
             .server
             .parse()
@@ -173,6 +201,49 @@ mod tests {
     #[test]
     fn default_config_path_points_to_yaml() {
         assert!(Cmd::default_config_path().ends_with(".config/enyo/llmapi.yaml"));
+    }
+
+    #[test]
+    fn config_path_prefers_explicit_then_local_toml_then_yaml_then_default() {
+        let dir = tempdir().unwrap();
+        let directory = dir.path();
+        let cmd = Cmd::parse_from(["llmapi", "list"]);
+        assert_eq!(cmd.config_path_in(directory), Cmd::default_config_path());
+
+        fs::write(
+            directory.join("config.yaml"),
+            "default: yaml\nproviders:\n  yaml:\n    type: chat\n    baseurl: https://yaml.test\n",
+        )
+        .unwrap();
+        assert_eq!(cmd.config_path_in(directory), directory.join("config.yaml"));
+        assert_eq!(
+            Config::load(cmd.config_path_in(directory)).unwrap().default,
+            "yaml"
+        );
+
+        fs::write(
+            directory.join("config.toml"),
+            "default = 'toml'\n[providers.toml]\ntype = 'chat'\nbaseurl = 'https://toml.test'\n",
+        )
+        .unwrap();
+        assert_eq!(cmd.config_path_in(directory), directory.join("config.toml"));
+        assert_eq!(
+            Config::load(cmd.config_path_in(directory)).unwrap().default,
+            "toml"
+        );
+
+        let explicit = directory.join("config.yaml");
+        let cmd = Cmd::parse_from(["llmapi", "list", "--config", explicit.to_str().unwrap()]);
+        assert_eq!(cmd.config_path_in(directory), explicit);
+        assert_eq!(
+            Config::load(cmd.config_path_in(directory)).unwrap().default,
+            "yaml"
+        );
+
+        let missing = directory.join("missing.yaml");
+        let cmd = Cmd::parse_from(["llmapi", "--config", missing.to_str().unwrap(), "list"]);
+        assert_eq!(cmd.config_path_in(directory), missing);
+        assert!(Config::load(cmd.config_path_in(directory)).is_err());
     }
 
     #[test]
@@ -289,11 +360,52 @@ mod tests {
 
     #[test]
     fn server_overrides_parse() {
-        let cmd = Cmd::parse_from(["llmapi", "server", "--server", "127.0.0.1:9090"]);
+        let cmd = Cmd::parse_from([
+            "llmapi",
+            "server",
+            "--server",
+            "127.0.0.1:9090",
+            "--default",
+            "openai",
+        ]);
         let Command::Server(args) = cmd.command else {
             unreachable!()
         };
         assert_eq!(args.server.as_deref(), Some("127.0.0.1:9090"));
+        assert_eq!(args.default.as_deref(), Some("openai"));
+
+        let mut config = Config {
+            server: "127.0.0.1:8080".into(),
+            default: "deepseek".into(),
+            providers: BTreeMap::from([
+                (
+                    "deepseek".into(),
+                    ProviderConfig {
+                        provider_type: Provider::OpenAiChat,
+                        base_url: "https://deepseek.test".into(),
+                        api_key: None,
+                    },
+                ),
+                (
+                    "openai".into(),
+                    ProviderConfig {
+                        provider_type: Provider::OpenAiResponses,
+                        base_url: "https://openai.test".into(),
+                        api_key: None,
+                    },
+                ),
+            ]),
+        };
+        args.apply_to(&mut config).unwrap();
+        assert_eq!(config.server, "127.0.0.1:9090");
+        assert_eq!(config.default, "openai");
+
+        let missing = Cmd::parse_from(["llmapi", "server", "--default", "missing"]);
+        let Command::Server(args) = missing.command else {
+            unreachable!()
+        };
+        assert!(args.apply_to(&mut config).is_err());
+        assert_eq!(config.default, "openai");
     }
 
     #[test]
