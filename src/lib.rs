@@ -19,7 +19,8 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand};
+use clap_complete::{generate, Shell};
 use comfy_table::Table;
 
 use config::{Config, Provider, ProviderConfig};
@@ -37,6 +38,12 @@ pub struct Cmd {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Shell completion scripts
+    #[clap(alias = "comp")]
+    Completion {
+        #[arg(help = "shell type")]
+        shell: Option<Shell>,
+    },
     /// List configured providers
     List,
     /// Add a provider
@@ -236,6 +243,11 @@ impl Cmd {
 
     pub async fn execute(&self) -> Result<()> {
         match &self.command {
+            Command::Completion { shell } => {
+                let shell = shell.or_else(Shell::from_env).unwrap_or(Shell::Bash);
+                generate(shell, &mut Self::command(), "llmapi", &mut io::stdout());
+                Ok(())
+            }
             Command::List => self.list(),
             Command::Add(args) => self.add(args),
             Command::Remove(args) => self.remove(args),
@@ -350,6 +362,19 @@ mod tests {
 
     #[test]
     fn parses_required_subcommands() {
+        let completion = Cmd::parse_from(["llmapi", "completion", "zsh"]);
+        assert!(matches!(
+            completion.command,
+            Command::Completion {
+                shell: Some(Shell::Zsh)
+            }
+        ));
+        assert!(matches!(
+            Cmd::parse_from(["llmapi", "comp", "fish"]).command,
+            Command::Completion {
+                shell: Some(Shell::Fish)
+            }
+        ));
         assert!(matches!(
             Cmd::parse_from(["llmapi", "list"]).command,
             Command::List

@@ -7,6 +7,7 @@ Completions, OpenAI Responses, and Anthropic Messages APIs.
 
 ```bash
 llmapi list
+llmapi completion [bash|elvish|fish|powershell|zsh] # alias: comp
 llmapi add <name> --type <chat|responses|messages> --baseurl <url> [--apikey|--apikey-stdin]
 llmapi rm <name>
 llmapi set default <provider>
@@ -14,6 +15,9 @@ llmapi server [--server 127.0.0.1:8080] [--default <provider>]
 llmapi daemon install [--workdir <path>] [--args server ...]
 llmapi daemon start|stop|restart|status|uninstall|remove
 ```
+
+`completion` writes a shell completion script to stdout. With no shell
+argument, it uses the current shell when detected, or Bash otherwise.
 
 `add --apikey` prompts without echoing the key. For piped input, use
 `printf '%s\n' "$API_KEY" | llmapi add <name> --type chat --baseurl <url> --apikey-stdin`.
