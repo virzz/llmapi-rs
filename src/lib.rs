@@ -402,6 +402,7 @@ mod tests {
     fn provider_list_marks_default_without_api_keys() {
         let config = Config {
             server: "127.0.0.1:8080".into(),
+            api_key: None,
             default: "deepseek".into(),
             providers: BTreeMap::from([(
                 "deepseek".into(),
@@ -445,6 +446,7 @@ mod tests {
 
         let mut config = Config {
             server: "127.0.0.1:8080".into(),
+            api_key: None,
             default: "deepseek".into(),
             providers: BTreeMap::from([
                 (

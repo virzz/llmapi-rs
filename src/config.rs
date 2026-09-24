@@ -9,6 +9,13 @@ const DEFAULT_SERVER: &str = "127.0.0.1:8080";
 pub struct Config {
     #[serde(default = "default_server")]
     pub server: String,
+    #[serde(
+        default,
+        rename = "apikey",
+        alias = "api_key",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub api_key: Option<String>,
     #[serde(default)]
     pub default: String,
     #[serde(default)]
@@ -67,6 +74,8 @@ pub enum ConfigError {
     DefaultProviderNotFound(String),
     #[error("invalid provider name: {0}")]
     InvalidProviderName(String),
+    #[error("server apikey cannot be empty")]
+    EmptyServerApiKey,
     #[error("expand environment variable {name}: {source}")]
     EnvVar {
         name: String,
@@ -79,6 +88,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             server: default_server(),
+            api_key: None,
             default: String::new(),
             providers: BTreeMap::new(),
         }
@@ -86,6 +96,17 @@ impl Default for Config {
 }
 
 impl Config {
+    pub fn api_key(&self) -> Result<Option<String>, ConfigError> {
+        let Some(configured) = &self.api_key else {
+            return Ok(None);
+        };
+        let key = expand_env(configured.clone())?;
+        if key.is_empty() {
+            return Err(ConfigError::EmptyServerApiKey);
+        }
+        Ok(Some(key))
+    }
+
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let path = path.as_ref();
         let body = fs::read_to_string(path)?;
@@ -174,6 +195,9 @@ impl Config {
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
+        if self.api_key.as_deref() == Some("") {
+            return Err(ConfigError::EmptyServerApiKey);
+        }
         for name in self.providers.keys() {
             validate_provider_name(name)?;
         }
@@ -318,6 +342,7 @@ providers:
         for extension in ["yaml", "yml", "toml", "json"] {
             let path = dir.path().join(format!("llmapi.{extension}"));
             let mut config = Config::load_for_update(&path).unwrap();
+            config.api_key = Some("${LLMAPI_API_KEY}".into());
             config
                 .add_provider(
                     "deepseek".into(),
@@ -342,6 +367,7 @@ providers:
             config.save(&path).unwrap();
 
             let loaded = Config::load(path).unwrap();
+            assert_eq!(loaded.api_key.as_deref(), Some("${LLMAPI_API_KEY}"));
             assert_eq!(loaded.default, "openai");
             assert_eq!(
                 loaded.providers["deepseek"].base_url,
@@ -359,6 +385,13 @@ providers:
             })
             .unwrap();
         assert!(matches!(error, ConfigError::DefaultProviderNotFound(_)));
+    }
+
+    #[test]
+    fn rejects_empty_server_api_key() {
+        let body = CONFIG_YAML.replacen("default:", "apikey: ''\ndefault:", 1);
+        let error = Config::parse(Path::new("llmapi.yaml"), &body).unwrap_err();
+        assert!(matches!(error, ConfigError::EmptyServerApiKey));
     }
 
     #[test]

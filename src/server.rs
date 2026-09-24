@@ -4,7 +4,8 @@ use anyhow::Result;
 use axum::{
     body::Body,
     extract::State,
-    http::{HeaderMap, Method, Request, Response, Uri},
+    http::{HeaderMap, Method, Request, Response, StatusCode, Uri},
+    middleware::{self, Next},
     response::IntoResponse,
     routing::{any, get},
     Json, Router,
@@ -13,7 +14,7 @@ use serde_json::json;
 use tokio::sync::{oneshot, watch};
 use tracing::{info, warn};
 
-use super::{config::Config, proxy, redact};
+use super::{auth, config::Config, proxy, redact};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -45,7 +46,34 @@ fn app_with_config(config: watch::Receiver<Arc<Config>>) -> Router {
     Router::new()
         .route("/providers", get(providers))
         .route("/{*path}", any(handler))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_api_key,
+        ))
         .with_state(state)
+}
+
+async fn require_api_key(
+    State(state): State<ServerState>,
+    request: Request<Body>,
+    next: Next,
+) -> Response<Body> {
+    let config = state.config.borrow().clone();
+    match config.api_key() {
+        Ok(None) => next.run(request).await,
+        Ok(Some(expected)) => {
+            let supplied = auth::extract_api_key(request.headers(), request.uri().query());
+            if supplied.as_deref() == Some(expected.as_str()) {
+                next.run(request).await
+            } else {
+                StatusCode::UNAUTHORIZED.into_response()
+            }
+        }
+        Err(err) => {
+            warn!(target: "llmapi", error = %err, "server API key is unavailable");
+            StatusCode::SERVICE_UNAVAILABLE.into_response()
+        }
+    }
 }
 
 async fn providers(State(state): State<ServerState>) -> impl IntoResponse {
@@ -427,6 +455,7 @@ mod tests {
     fn test_config(base_url: &str) -> Config {
         Config {
             server: "127.0.0.1:0".into(),
+            api_key: None,
             default: "deepseek".into(),
             providers: BTreeMap::from([
                 (
@@ -862,6 +891,64 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), reqwest::StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    #[tokio::test]
+    async fn server_api_key_protects_routes_and_is_not_forwarded() {
+        let (upstream, captured) = start_upstream(json!({"object": "list", "data": []})).await;
+        let mut config = test_config(&upstream);
+        config.api_key = Some("client-secret".into());
+        config.providers.get_mut("deepseek").unwrap().api_key = None;
+        let proxy = start_proxy(config).await;
+        let client = reqwest::Client::new();
+
+        for path in ["providers", "models"] {
+            let url = format!("http://{proxy}/{path}");
+            assert_eq!(client.get(&url).send().await.unwrap().status(), 401);
+            assert_eq!(
+                client
+                    .get(&url)
+                    .bearer_auth("wrong")
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                401
+            );
+            assert_eq!(
+                client
+                    .get(&url)
+                    .bearer_auth("client-secret")
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                200
+            );
+        }
+        assert_eq!(
+            client
+                .get(format!("http://{proxy}/providers"))
+                .header("x-api-key", "client-secret")
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            200
+        );
+        assert_eq!(
+            client
+                .get(format!("http://{proxy}/providers?key=client-secret"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            200
+        );
+        let request = captured.lock().await;
+        let headers = &request.as_ref().unwrap().headers;
+        assert!(!headers.contains_key("authorization"));
+        assert!(!headers.contains_key("x-api-key"));
     }
 
     #[tokio::test]

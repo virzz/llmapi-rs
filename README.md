@@ -32,6 +32,11 @@ the fallback path is `~/.config/enyo/llmapi.yaml`.
 An explicitly selected file never falls back; `add` can create a new file there.
 The `server` command's `--server` and `--default` arguments override the selected
 file's listen address and default provider without modifying the file.
+Set top-level `apikey` (for example, `apikey: ${LLMAPI_API_KEY}`) to require a
+client key on every HTTP route. Clients can send `Authorization: Bearer <key>`,
+`x-api-key`, `api-key`, or the `key` query parameter. Missing or incorrect keys
+return 401. An unset top-level `apikey` keeps the server open; provider `apikey`
+values remain separate upstream credentials.
 While running, the server checks the selected file every 500 ms and applies valid
 provider/default changes to new requests. Changes to `server` bind a new listener
 before closing the old one; if binding fails, the old listener remains and the

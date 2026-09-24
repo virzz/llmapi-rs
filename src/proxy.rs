@@ -281,7 +281,11 @@ fn send_upstream_request(
     url: &str,
     body: Bytes,
 ) -> impl std::future::Future<Output = Result<reqwest::Response, reqwest::Error>> + Send {
-    let extracted = auth::extract_api_key(headers, auth_query);
+    let extracted = if state.config.api_key.is_none() {
+        auth::extract_api_key(headers, auth_query)
+    } else {
+        None
+    };
     let mut upstream_headers = HeaderMap::new();
     auth::apply_api_key(
         &mut upstream_headers,
