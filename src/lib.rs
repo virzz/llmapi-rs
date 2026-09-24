@@ -13,6 +13,7 @@ mod redact;
 pub mod server;
 
 use std::{
+    io::{self, IsTerminal},
     net::SocketAddr,
     path::{Path, PathBuf},
 };
@@ -40,6 +41,9 @@ enum Command {
     List,
     /// Add a provider
     Add(AddArgs),
+    /// Remove a provider
+    #[command(visible_alias = "rm")]
+    Remove(RemoveArgs),
     /// Change llmapi settings
     Set(SetArgs),
     /// Start the HTTP server
@@ -59,9 +63,18 @@ struct AddArgs {
     /// Upstream API base URL
     #[arg(long)]
     baseurl: String,
-    /// Upstream API key
-    #[arg(long)]
-    apikey: Option<String>,
+    /// Read the upstream API key interactively without echoing it
+    #[arg(long, conflicts_with = "apikey_stdin")]
+    apikey: bool,
+    /// Read the upstream API key from stdin
+    #[arg(long = "apikey-stdin", conflicts_with = "apikey")]
+    apikey_stdin: bool,
+}
+
+#[derive(Debug, Args)]
+struct RemoveArgs {
+    /// Provider name
+    name: String,
 }
 
 #[derive(Debug, Args)]
@@ -143,14 +156,41 @@ impl Cmd {
         let path = self.config_path();
         let mut config = Config::load_for_update(&path)
             .with_context(|| format!("load config {}", path.display()))?;
+        let api_key = if args.apikey {
+            Some(rpassword::prompt_password("Upstream API key: ")?)
+        } else if args.apikey_stdin {
+            anyhow::ensure!(
+                !io::stdin().is_terminal(),
+                "--apikey-stdin requires piped stdin"
+            );
+            let mut key = String::new();
+            io::stdin().read_line(&mut key)?;
+            Some(key.trim_end_matches(['\r', '\n']).to_owned())
+        } else {
+            None
+        };
+        if let Some(key) = &api_key {
+            anyhow::ensure!(!key.is_empty(), "upstream API key cannot be empty");
+        }
         config.add_provider(
             args.name.clone(),
             ProviderConfig {
                 provider_type: args.provider_type,
                 base_url: args.baseurl.clone(),
-                api_key: args.apikey.clone(),
+                api_key,
             },
         )?;
+        config
+            .save(&path)
+            .with_context(|| format!("save config {}", path.display()))?;
+        Ok(())
+    }
+
+    fn remove(&self, args: &RemoveArgs) -> Result<()> {
+        let path = self.config_path();
+        let mut config =
+            Config::load(&path).with_context(|| format!("load config {}", path.display()))?;
+        config.remove_provider(&args.name)?;
         config
             .save(&path)
             .with_context(|| format!("save config {}", path.display()))?;
@@ -198,6 +238,7 @@ impl Cmd {
         match &self.command {
             Command::List => self.list(),
             Command::Add(args) => self.add(args),
+            Command::Remove(args) => self.remove(args),
             Command::Set(args) => self.set(args),
             Command::Server(args) => self.serve(args).await,
             #[cfg(target_os = "macos")]
@@ -321,16 +362,44 @@ mod tests {
             "chat",
             "--baseurl",
             "https://api.deepseek.test",
-            "--apikey",
-            "sk-test",
+            "--apikey-stdin",
         ]);
         assert!(matches!(
             add.command,
             Command::Add(AddArgs {
                 provider_type: Provider::OpenAiChat,
+                apikey_stdin: true,
                 ..
             })
         ));
+        let interactive = Cmd::parse_from([
+            "llmapi",
+            "add",
+            "openai",
+            "--type",
+            "responses",
+            "--baseurl",
+            "https://api.openai.test",
+            "--apikey",
+        ]);
+        assert!(matches!(
+            interactive.command,
+            Command::Add(AddArgs { apikey: true, .. })
+        ));
+        assert!(Cmd::try_parse_from([
+            "llmapi",
+            "add",
+            "openai",
+            "--type",
+            "responses",
+            "--baseurl",
+            "https://api.openai.test",
+            "--apikey",
+            "plaintext",
+        ])
+        .is_err());
+        let remove = Cmd::parse_from(["llmapi", "rm", "deepseek"]);
+        assert!(matches!(remove.command, Command::Remove(RemoveArgs { .. })));
         let set = Cmd::parse_from(["llmapi", "set", "default", "deepseek"]);
         assert!(matches!(
             set.command,
@@ -396,6 +465,44 @@ mod tests {
         let config = Config::load(path).unwrap();
         assert_eq!(config.default, "openai");
         assert_eq!(config.providers.len(), 2);
+    }
+
+    #[test]
+    fn remove_command_deletes_provider_and_reselects_default() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("llmapi.yaml");
+        let mut config = Config::default();
+        config
+            .add_provider(
+                "first".into(),
+                ProviderConfig {
+                    provider_type: Provider::OpenAiChat,
+                    base_url: "https://first.test".into(),
+                    api_key: None,
+                },
+            )
+            .unwrap();
+        config
+            .add_provider(
+                "second".into(),
+                ProviderConfig {
+                    provider_type: Provider::OpenAiChat,
+                    base_url: "https://second.test".into(),
+                    api_key: None,
+                },
+            )
+            .unwrap();
+        config.save(&path).unwrap();
+
+        let cmd = Cmd::parse_from(["llmapi", "-c", path.to_str().unwrap(), "rm", "first"]);
+        let Command::Remove(args) = &cmd.command else {
+            unreachable!()
+        };
+        cmd.remove(args).unwrap();
+
+        let config = Config::load(&path).unwrap();
+        assert_eq!(config.default, "second");
+        assert_eq!(config.providers.len(), 1);
     }
 
     #[test]

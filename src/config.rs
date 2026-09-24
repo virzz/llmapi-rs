@@ -178,6 +178,16 @@ impl Config {
         Ok(())
     }
 
+    pub fn remove_provider(&mut self, name: &str) -> Result<(), ConfigError> {
+        if self.providers.remove(name).is_none() {
+            return Err(ConfigError::ProviderNotFound(name.to_string()));
+        }
+        if self.default == name {
+            self.default = self.providers.keys().next().cloned().unwrap_or_default();
+        }
+        Ok(())
+    }
+
     pub fn provider(&self, name: Option<&str>) -> Result<(&str, &ProviderConfig), ConfigError> {
         let name = name.unwrap_or(&self.default);
         self.providers
@@ -201,7 +211,9 @@ impl Config {
         for name in self.providers.keys() {
             validate_provider_name(name)?;
         }
-        if !self.providers.contains_key(&self.default) {
+        if !(self.providers.is_empty() && self.default.is_empty())
+            && !self.providers.contains_key(&self.default)
+        {
             return Err(ConfigError::DefaultProviderNotFound(self.default.clone()));
         }
         Ok(())
@@ -392,6 +404,24 @@ providers:
         let body = CONFIG_YAML.replacen("default:", "apikey: ''\ndefault:", 1);
         let error = Config::parse(Path::new("llmapi.yaml"), &body).unwrap_err();
         assert!(matches!(error, ConfigError::EmptyServerApiKey));
+    }
+
+    #[test]
+    fn removing_last_provider_keeps_config_loadable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("llmapi.yaml");
+        let mut config = Config::parse(&path, CONFIG_YAML).unwrap();
+        assert!(matches!(
+            config.remove_provider("missing"),
+            Err(ConfigError::ProviderNotFound(_))
+        ));
+        config.remove_provider("deepseek").unwrap();
+        assert_eq!(config.default, "anthropic");
+        config.remove_provider("anthropic").unwrap();
+        config.remove_provider("openai").unwrap();
+        assert!(config.default.is_empty());
+        config.save(&path).unwrap();
+        assert_eq!(Config::load(&path).unwrap(), config);
     }
 
     #[test]

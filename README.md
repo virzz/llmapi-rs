@@ -7,12 +7,20 @@ Completions, OpenAI Responses, and Anthropic Messages APIs.
 
 ```bash
 llmapi list
-llmapi add <name> --type <chat|responses|messages> --baseurl <url> [--apikey <key>]
+llmapi add <name> --type <chat|responses|messages> --baseurl <url> [--apikey|--apikey-stdin]
+llmapi rm <name>
 llmapi set default <provider>
 llmapi server [--server 127.0.0.1:8080] [--default <provider>]
 llmapi daemon install [--workdir <path>] [--args server ...]
 llmapi daemon start|stop|restart|status|uninstall|remove
 ```
+
+`add --apikey` prompts without echoing the key. For piped input, use
+`printf '%s\n' "$API_KEY" | llmapi add <name> --type chat --baseurl <url> --apikey-stdin`.
+`add` rejects empty keys and plaintext key arguments. Omit both flags to leave
+the upstream key unset. `remove` (alias `rm`) deletes a provider; deleting the
+default selects the first remaining provider by name. The last provider can
+also be removed. Saved provider keys remain in the config file as plaintext.
 
 On macOS, `daemon install` writes a user LaunchAgent to
 `~/Library/LaunchAgents/com.virzz.enyo.llmapi.plist`. The default working
