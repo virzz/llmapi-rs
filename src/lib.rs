@@ -46,6 +46,11 @@ enum Command {
     },
     /// List configured providers
     List,
+    /// Show the current default provider
+    Status,
+    /// Select the default provider
+    #[command(visible_alias = "default")]
+    Select(ProviderArgs),
     /// Add a provider
     Add(AddArgs),
     /// Remove a provider
@@ -82,6 +87,12 @@ struct AddArgs {
 struct RemoveArgs {
     /// Provider name
     name: String,
+}
+
+#[derive(Debug, Args)]
+struct ProviderArgs {
+    /// Provider name
+    provider: String,
 }
 
 #[derive(Debug, Args)]
@@ -159,6 +170,12 @@ impl Cmd {
         Ok(())
     }
 
+    fn status(&self) -> Result<()> {
+        let config = self.load_config()?;
+        print!("{}", format_default_provider(&config));
+        Ok(())
+    }
+
     fn add(&self, args: &AddArgs) -> Result<()> {
         let path = self.config_path();
         let mut config = Config::load_for_update(&path)
@@ -217,6 +234,17 @@ impl Cmd {
         Ok(())
     }
 
+    fn select(&self, args: &ProviderArgs) -> Result<()> {
+        let path = self.config_path();
+        let mut config =
+            Config::load(&path).with_context(|| format!("load config {}", path.display()))?;
+        config.set_default(&args.provider)?;
+        config
+            .save(&path)
+            .with_context(|| format!("save config {}", path.display()))?;
+        Ok(())
+    }
+
     fn load_config(&self) -> Result<Config> {
         let path = self.config_path();
         Config::load(&path).with_context(|| format!("load config {}", path.display()))
@@ -249,6 +277,8 @@ impl Cmd {
                 Ok(())
             }
             Command::List => self.list(),
+            Command::Status => self.status(),
+            Command::Select(args) => self.select(args),
             Command::Add(args) => self.add(args),
             Command::Remove(args) => self.remove(args),
             Command::Set(args) => self.set(args),
@@ -271,6 +301,10 @@ fn format_provider_list(config: &Config) -> String {
         ]);
     }
     format!("{table}\n")
+}
+
+fn format_default_provider(config: &Config) -> String {
+    format!("{}\n", config.default)
 }
 
 #[cfg(test)]
@@ -378,6 +412,18 @@ mod tests {
         assert!(matches!(
             Cmd::parse_from(["llmapi", "list"]).command,
             Command::List
+        ));
+        assert!(matches!(
+            Cmd::parse_from(["llmapi", "status"]).command,
+            Command::Status
+        ));
+        assert!(matches!(
+            Cmd::parse_from(["llmapi", "select", "deepseek"]).command,
+            Command::Select(ProviderArgs { .. })
+        ));
+        assert!(matches!(
+            Cmd::parse_from(["llmapi", "default", "deepseek"]).command,
+            Command::Select(ProviderArgs { .. })
         ));
         let add = Cmd::parse_from([
             "llmapi",
@@ -490,6 +536,69 @@ mod tests {
         let config = Config::load(path).unwrap();
         assert_eq!(config.default, "openai");
         assert_eq!(config.providers.len(), 2);
+    }
+
+    #[test]
+    fn select_and_default_commands_persist_config() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("llmapi.yaml");
+        let mut config = Config::default();
+        config
+            .add_provider(
+                "first".into(),
+                ProviderConfig {
+                    provider_type: Provider::OpenAiChat,
+                    base_url: "https://first.test".into(),
+                    api_key: None,
+                },
+            )
+            .unwrap();
+        config
+            .add_provider(
+                "second".into(),
+                ProviderConfig {
+                    provider_type: Provider::OpenAiChat,
+                    base_url: "https://second.test".into(),
+                    api_key: None,
+                },
+            )
+            .unwrap();
+        config.save(&path).unwrap();
+
+        let select = Cmd::parse_from([
+            "llmapi",
+            "--config",
+            path.to_str().unwrap(),
+            "select",
+            "second",
+        ]);
+        let Command::Select(args) = &select.command else {
+            unreachable!()
+        };
+        select.select(args).unwrap();
+        assert_eq!(Config::load(&path).unwrap().default, "second");
+
+        let default = Cmd::parse_from([
+            "llmapi",
+            "--config",
+            path.to_str().unwrap(),
+            "default",
+            "first",
+        ]);
+        let Command::Select(args) = &default.command else {
+            unreachable!()
+        };
+        default.select(args).unwrap();
+        assert_eq!(Config::load(&path).unwrap().default, "first");
+    }
+
+    #[test]
+    fn status_uses_configured_default_provider() {
+        let config = Config {
+            default: "deepseek".into(),
+            ..Config::default()
+        };
+        assert_eq!(format_default_provider(&config), "deepseek\n");
     }
 
     #[test]
