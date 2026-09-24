@@ -65,6 +65,10 @@ the last valid config; changing the selected config path requires a restart.
 | OpenAI Responses   | `/responses`        | `/{provider}/responses`        |
 | Anthropic Messages | `/messages`         | `/{provider}/messages`         |
 
+`/responses` also accepts a WebSocket upgrade when the selected provider uses
+`openai-responses`; WebSocket messages are forwarded transparently to that
+provider.
+
 `GET /models` and `GET /v1/models` (also under `/{provider}`) accept upstream
 OpenAI `data` or Codex `models` lists. Codex requests (identified by
 `client_version` or a Codex User-Agent) receive `models`; other clients receive

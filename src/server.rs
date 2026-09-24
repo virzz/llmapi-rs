@@ -3,7 +3,7 @@ use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 use anyhow::Result;
 use axum::{
     body::Body,
-    extract::State,
+    extract::{ws::WebSocketUpgrade, State},
     http::{HeaderMap, Method, Request, Response, StatusCode, Uri},
     middleware::{self, Next},
     response::IntoResponse,
@@ -245,6 +245,7 @@ fn handler(
     method: Method,
     uri: Uri,
     headers: HeaderMap,
+    ws: Result<WebSocketUpgrade, axum::extract::ws::rejection::WebSocketUpgradeRejection>,
     body: Body,
 ) -> impl std::future::Future<Output = Response<Body>> + Send {
     info!(
@@ -262,7 +263,7 @@ fn handler(
         config: state.config.borrow().clone(),
         client: state.client.clone(),
     };
-    proxy::handle(snapshot, headers, request)
+    proxy::handle_with_websocket(snapshot, headers, request, ws.ok())
 }
 
 #[cfg(test)]

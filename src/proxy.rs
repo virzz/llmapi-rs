@@ -1,10 +1,12 @@
 use axum::{
     body::{to_bytes, Body},
+    extract::ws::{Message as AxumMessage, WebSocket, WebSocketUpgrade},
     http::{header, HeaderMap, HeaderValue, Method, Response, StatusCode},
 };
 use bytes::{Bytes, BytesMut};
-use futures_util::{FutureExt, StreamExt};
+use futures_util::{FutureExt, SinkExt, StreamExt};
 use serde_json::{json, Value};
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tracing::{debug, error, info, warn};
 
 use super::{
@@ -42,6 +44,15 @@ pub async fn handle(
     headers: HeaderMap,
     request: axum::http::Request<Body>,
 ) -> Response<Body> {
+    handle_with_websocket(state, headers, request, None).await
+}
+
+pub async fn handle_with_websocket(
+    state: AppState,
+    headers: HeaderMap,
+    request: axum::http::Request<Body>,
+    websocket: Option<WebSocketUpgrade>,
+) -> Response<Body> {
     let upstream_raw = wants_upstream_raw(request.uri(), &headers);
     let query = request.uri().query().map(ToString::to_string);
     let method = request.method().clone();
@@ -53,6 +64,36 @@ pub async fn handle(
             "text/plain",
         );
     };
+    if let Some(websocket) = websocket {
+        if route.input != InputFormat::OpenAiResponses {
+            return protocol_error_response(
+                &route.input,
+                StatusCode::METHOD_NOT_ALLOWED,
+                "WebSocket is supported only for the Responses endpoint",
+                "invalid_request_error",
+            );
+        }
+        let Some((_, provider)) = state.config.provider(route.provider.as_deref()).ok() else {
+            return protocol_error_response(
+                &route.input,
+                StatusCode::NOT_FOUND,
+                "provider not found",
+                "invalid_request_error",
+            );
+        };
+        if provider.provider_type != Provider::OpenAiResponses {
+            return protocol_error_response(
+                &route.input,
+                StatusCode::BAD_REQUEST,
+                "WebSocket requires an openai-responses provider",
+                "invalid_request_error",
+            );
+        }
+        let provider = provider.clone();
+        let query = request.uri().query().map(ToString::to_string);
+        return websocket
+            .on_upgrade(move |socket| proxy_websocket(state, headers, provider, query, socket));
+    }
     let expected_method = if route.input == InputFormat::Models {
         Method::GET
     } else {
@@ -156,6 +197,107 @@ pub async fn handle(
         upstream_raw,
     })
     .await
+}
+
+async fn proxy_websocket(
+    state: AppState,
+    headers: HeaderMap,
+    provider: ProviderConfig,
+    query: Option<String>,
+    mut client: WebSocket,
+) {
+    let provider_key = match provider.api_key() {
+        Ok(key) => key,
+        Err(err) => {
+            let _ = client
+                .send(AxumMessage::Text(format!("{{\"error\":\"{err}\"}}").into()))
+                .await;
+            let _ = client.close().await;
+            return;
+        }
+    };
+    let extracted = if state.config.api_key.is_none() {
+        auth::extract_api_key(&headers, query.as_deref())
+    } else {
+        None
+    };
+    let mut upstream_headers = HeaderMap::new();
+    auth::apply_api_key(
+        &mut upstream_headers,
+        provider.provider_type,
+        provider_key.as_deref(),
+        extracted.as_deref(),
+    );
+    auth::apply_protocol_headers(&mut upstream_headers, provider.provider_type, &headers);
+    let url = websocket_url(&provider.base_url, "/responses", query.as_deref());
+    let mut upstream_request = match url.into_client_request() {
+        Ok(request) => request,
+        Err(err) => {
+            warn!(target: "llmapi", error = %err, "invalid upstream WebSocket URL");
+            let _ = client.close().await;
+            return;
+        }
+    };
+    *upstream_request.headers_mut() = upstream_headers;
+    let (upstream, _) = match tokio_tungstenite::connect_async(upstream_request).await {
+        Ok(connection) => connection,
+        Err(err) => {
+            warn!(target: "llmapi", error = %err, "upstream WebSocket connection failed");
+            let _ = client.close().await;
+            return;
+        }
+    };
+    let (mut client_sink, mut client_stream) = client.split();
+    let (mut upstream_sink, mut upstream_stream) = upstream.split();
+    tokio::select! {
+        _ = async {
+            while let Some(message) = client_stream.next().await {
+                let Some(message) = message.ok() else { break };
+                let Some(message) = axum_to_tungstenite(message) else { break };
+                if upstream_sink.send(message).await.is_err() { break; }
+            }
+        } => {}
+        _ = async {
+            while let Some(message) = upstream_stream.next().await {
+                let Some(message) = message.ok() else { break };
+                let Some(message) = tungstenite_to_axum(message) else { break; };
+                if client_sink.send(message).await.is_err() { break; }
+            }
+        } => {}
+    }
+}
+
+fn axum_to_tungstenite(message: AxumMessage) -> Option<tokio_tungstenite::tungstenite::Message> {
+    use tokio_tungstenite::tungstenite::Message;
+    match message {
+        AxumMessage::Text(text) => Some(Message::Text(text.to_string().into())),
+        AxumMessage::Binary(bytes) => Some(Message::Binary(bytes.to_vec().into())),
+        AxumMessage::Ping(bytes) => Some(Message::Ping(bytes.to_vec().into())),
+        AxumMessage::Pong(bytes) => Some(Message::Pong(bytes.to_vec().into())),
+        AxumMessage::Close(frame) => Some(Message::Close(frame.map(|frame| {
+            tokio_tungstenite::tungstenite::protocol::CloseFrame {
+                code: frame.code.into(),
+                reason: frame.reason.to_string().into(),
+            }
+        }))),
+    }
+}
+
+fn tungstenite_to_axum(message: tokio_tungstenite::tungstenite::Message) -> Option<AxumMessage> {
+    use tokio_tungstenite::tungstenite::Message;
+    match message {
+        Message::Text(text) => Some(AxumMessage::Text(text.to_string().into())),
+        Message::Binary(bytes) => Some(AxumMessage::Binary(bytes.to_vec().into())),
+        Message::Ping(bytes) => Some(AxumMessage::Ping(bytes.to_vec().into())),
+        Message::Pong(bytes) => Some(AxumMessage::Pong(bytes.to_vec().into())),
+        Message::Close(frame) => Some(AxumMessage::Close(frame.map(|frame| {
+            axum::extract::ws::CloseFrame {
+                code: frame.code.into(),
+                reason: frame.reason.to_string().into(),
+            }
+        }))),
+        Message::Frame(_) => None,
+    }
 }
 
 async fn models_response(upstream: reqwest::Response, codex_client: bool) -> Response<Body> {
@@ -423,6 +565,17 @@ fn upstream_url(base_url: &str, path: &str, query: Option<&str>) -> String {
     match query.and_then(forwarded_query) {
         Some(query) => format!("{endpoint}?{query}"),
         None => endpoint,
+    }
+}
+
+fn websocket_url(base_url: &str, path: &str, query: Option<&str>) -> String {
+    let http_url = upstream_url(base_url, path, query);
+    if let Some(rest) = http_url.strip_prefix("https://") {
+        format!("wss://{rest}")
+    } else if let Some(rest) = http_url.strip_prefix("http://") {
+        format!("ws://{rest}")
+    } else {
+        http_url
     }
 }
 
@@ -837,6 +990,22 @@ mod tests {
         assert_eq!(
             upstream_url("https://api.openai.test/v1", "/responses", None),
             "https://api.openai.test/v1/responses"
+        );
+    }
+
+    #[test]
+    fn builds_websocket_url_and_filters_client_secrets() {
+        assert_eq!(
+            websocket_url(
+                "https://api.openai.test/v1",
+                "/responses",
+                Some("key=sk-secret&stream=true&llmapi_response_mode=upstream_raw"),
+            ),
+            "wss://api.openai.test/v1/responses?stream=true"
+        );
+        assert_eq!(
+            websocket_url("http://127.0.0.1:9000", "/responses", None),
+            "ws://127.0.0.1:9000/responses"
         );
     }
 
