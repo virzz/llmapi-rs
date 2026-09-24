@@ -1,6 +1,6 @@
 [package]
 name = "llmapi"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 authors = ["Mozhu <mozhu233@outlook.com>"]
 description = "Multi-provider LLM API protocol conversion proxy"
