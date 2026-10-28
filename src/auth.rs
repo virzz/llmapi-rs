@@ -32,6 +32,7 @@ pub fn apply_api_key(
     };
 
     match provider {
+        Provider::Codex => {}
         Provider::OpenAiChat | Provider::OpenAiResponses => {
             if let Ok(value) = HeaderValue::from_str(&format!("Bearer {key}")) {
                 headers.insert(header::AUTHORIZATION, value);
@@ -63,9 +64,16 @@ pub fn apply_protocol_headers(headers: &mut HeaderMap, provider: Provider, sourc
                 headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
             }
         }
-        Provider::OpenAiChat | Provider::OpenAiResponses => {
+        Provider::OpenAiChat | Provider::OpenAiResponses | Provider::Codex => {
             if let Some(value) = source.get("openai-beta") {
                 headers.insert("openai-beta", value.clone());
+            }
+            if provider == Provider::Codex {
+                for name in ["session-id", "thread-id"] {
+                    if let Some(value) = source.get(name) {
+                        headers.insert(name, value.clone());
+                    }
+                }
             }
         }
     }

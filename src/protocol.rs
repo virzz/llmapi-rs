@@ -52,7 +52,9 @@ fn detect_endpoint(path: &str) -> Option<InputFormat> {
 pub fn upstream_for(provider: Provider) -> (UpstreamFormat, &'static str) {
     match provider {
         Provider::OpenAiChat => (UpstreamFormat::OpenAiChat, "/chat/completions"),
-        Provider::OpenAiResponses => (UpstreamFormat::OpenAiResponses, "/responses"),
+        Provider::OpenAiResponses | Provider::Codex => {
+            (UpstreamFormat::OpenAiResponses, "/responses")
+        }
         Provider::Anthropic => (UpstreamFormat::AnthropicMessages, "/messages"),
     }
 }

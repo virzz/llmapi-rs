@@ -80,6 +80,48 @@ does not resolve environment variables or contact upstream providers.
 
 See [examples/config.yaml](examples/config.yaml) for the provider configuration format.
 
+## Codex ChatGPT provider
+
+`llmapi` automatically discovers `~/.codex/auth.json` when `auth_mode` is
+`chatgpt` and `tokens.access_token` is present. No provider entry or API key is
+needed. It reads the file at server startup and every **5 minutes**, including
+when the file does not yet exist. Missing, unreadable, invalid, or non-ChatGPT
+credentials disable the automatic provider on the next poll.
+
+```bash
+llmapi server
+# Or select Codex as the default without adding a provider entry:
+llmapi select codex
+```
+
+Use `/codex/responses`, `/codex/chat/completions`, `/codex/messages`, and
+`/codex/models` (also with `/v1` after `/codex`). The automatic provider appears
+in `llmapi list` and `GET /providers`. Configured providers and their default
+remain in effect; a configured provider named `codex` takes precedence. With
+no config file or providers, Codex becomes the runtime default when available.
+An explicitly selected missing config file still returns an error.
+
+The proxy uses the local access token and account ID for
+`https://chatgpt.com/backend-api/codex`. It **never refreshes tokens or writes
+auth.json**. Keep the login managed by Codex; updates can take up to five
+minutes to reach llmapi. An upstream 401 is returned without retrying. Credentials
+are not written to llmapi config or exposed by the provider listing. Only the
+file at `~/.codex/auth.json` is used; Keychain-only logins are not discovered.
+
+Both streaming and non-streaming HTTP requests are supported. The backend
+always uses Responses SSE with `store=false`; non-streaming clients receive
+the final JSON response. Native Responses streams preserve upstream events.
+WebSocket requests are not supported for this provider.
+
+Codex requests omit unsupported sampling/output-limit fields (`temperature`,
+`top_p`, `stop`, `max_output_tokens`, and `max_completion_tokens`), including
+output limits converted from Chat or Messages. Those settings have no effect
+on the backend. `user`, `safety_identifier`, and `prompt_cache_options` are also
+omitted; only `priority` and `ultrafast` service tiers are forwarded. Stored
+conversation references (`previous_response_id`, `conversation`, and input
+`item_reference`) are rejected; send the full history instead. Model access
+and usage limits follow the ChatGPT account.
+
 ## Development
 
 ```bash

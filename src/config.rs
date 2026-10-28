@@ -48,6 +48,10 @@ pub enum Provider {
     #[serde(rename = "anthropic", alias = "messages")]
     #[value(name = "anthropic", alias = "messages")]
     Anthropic,
+    /// Discovered from the local Codex login; never stored as provider config.
+    #[serde(rename = "codex", skip_deserializing)]
+    #[value(skip)]
+    Codex,
 }
 
 #[derive(Debug, Error)]
@@ -171,7 +175,7 @@ impl Config {
     }
 
     pub fn set_default(&mut self, name: &str) -> Result<(), ConfigError> {
-        if !self.providers.contains_key(name) {
+        if name != "codex" && !self.providers.contains_key(name) {
             return Err(ConfigError::ProviderNotFound(name.to_string()));
         }
         self.default = name.to_string();
@@ -196,6 +200,22 @@ impl Config {
             .ok_or_else(|| ConfigError::ProviderNotFound(name.to_string()))
     }
 
+    pub(crate) fn with_codex(mut self, available: bool) -> Self {
+        if available {
+            self.providers
+                .entry("codex".into())
+                .or_insert_with(|| ProviderConfig {
+                    provider_type: Provider::Codex,
+                    base_url: crate::codex::BASE_URL.into(),
+                    api_key: None,
+                });
+            if self.default.is_empty() {
+                self.default = "codex".into();
+            }
+        }
+        self
+    }
+
     fn normalize(&mut self) {
         self.server = self.server.trim().to_string();
         self.default = self.default.trim().to_string();
@@ -212,6 +232,7 @@ impl Config {
             validate_provider_name(name)?;
         }
         if !(self.providers.is_empty() && self.default.is_empty())
+            && self.default != "codex"
             && !self.providers.contains_key(&self.default)
         {
             return Err(ConfigError::DefaultProviderNotFound(self.default.clone()));
@@ -236,6 +257,7 @@ impl Provider {
             Self::OpenAiChat => "openai-chat",
             Self::OpenAiResponses => "openai-responses",
             Self::Anthropic => "anthropic",
+            Self::Codex => "codex",
         }
     }
 }
@@ -305,6 +327,34 @@ fn expand_env(value: String) -> Result<String, ConfigError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn automatic_codex_preserves_configured_providers_and_default() {
+        let config = Config::parse(Path::new("config.yaml"), CONFIG_YAML).unwrap();
+        let effective = config.clone().with_codex(true);
+        assert_eq!(effective.default, "deepseek");
+        assert_eq!(effective.providers["codex"].provider_type, Provider::Codex);
+        assert!(!config.providers.contains_key("codex"));
+        assert_eq!(config.clone().with_codex(false), config);
+        let mut collision = config;
+        let manual = collision.providers["openai"].clone();
+        collision.providers.insert("codex".into(), manual.clone());
+        assert_eq!(collision.with_codex(true).providers["codex"], manual);
+        assert_eq!(Config::default().with_codex(true).default, "codex");
+    }
+
+    #[test]
+    fn selecting_codex_persists_only_the_default_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        let mut config = Config::default();
+        config.set_default("codex").unwrap();
+        config.save(&path).unwrap();
+        let saved = Config::load(path).unwrap();
+        assert_eq!(saved.default, "codex");
+        assert!(saved.providers.is_empty());
+        assert!(saved.with_codex(true).provider(None).is_ok());
+    }
 
     const CONFIG_YAML: &str = r#"
 default: deepseek

@@ -2,6 +2,7 @@
 
 pub mod adapters;
 pub mod auth;
+mod codex;
 pub mod config;
 #[cfg(target_os = "macos")]
 pub mod daemon;
@@ -165,13 +166,13 @@ impl Cmd {
     }
 
     fn list(&self) -> Result<()> {
-        let config = self.load_config()?;
+        let config = self.load_config()?.with_codex(codex::available());
         print!("{}", format_provider_list(&config));
         Ok(())
     }
 
     fn status(&self) -> Result<()> {
-        let config = self.load_config()?;
+        let config = self.load_config()?.with_codex(codex::available());
         print!("{}", format_default_provider(&config));
         Ok(())
     }
@@ -223,8 +224,7 @@ impl Cmd {
 
     fn set(&self, args: &SetArgs) -> Result<()> {
         let path = self.config_path();
-        let mut config =
-            Config::load(&path).with_context(|| format!("load config {}", path.display()))?;
+        let mut config = self.load_config()?;
         match &args.command {
             SetCommand::Default { provider } => config.set_default(provider)?,
         }
@@ -236,8 +236,7 @@ impl Cmd {
 
     fn select(&self, args: &ProviderArgs) -> Result<()> {
         let path = self.config_path();
-        let mut config =
-            Config::load(&path).with_context(|| format!("load config {}", path.display()))?;
+        let mut config = self.load_config()?;
         config.set_default(&args.provider)?;
         config
             .save(&path)
@@ -247,13 +246,17 @@ impl Cmd {
 
     fn load_config(&self) -> Result<Config> {
         let path = self.config_path();
-        Config::load(&path).with_context(|| format!("load config {}", path.display()))
+        let result = if self.config.is_some() {
+            Config::load(&path)
+        } else {
+            Config::load_for_update(&path)
+        };
+        result.with_context(|| format!("load config {}", path.display()))
     }
 
     async fn serve(&self, args: &ServerArgs) -> Result<()> {
         let path = self.config_path();
-        let mut config =
-            Config::load(&path).with_context(|| format!("load config {}", path.display()))?;
+        let mut config = self.load_config()?;
         args.apply_to(&mut config)?;
         let addr: SocketAddr = config
             .server

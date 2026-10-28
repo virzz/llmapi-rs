@@ -14,18 +14,37 @@ use serde_json::json;
 use tokio::sync::{oneshot, watch};
 use tracing::{info, warn};
 
-use super::{auth, config::Config, proxy, redact};
+use super::{auth, codex, config::Config, proxy, redact};
 
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<Config>,
     pub client: reqwest::Client,
+    pub codex_headers: Option<HeaderMap>,
 }
 
 #[derive(Clone)]
 struct ServerState {
     config: watch::Receiver<Arc<Config>>,
     client: reqwest::Client,
+    codex_auth: watch::Receiver<Option<HeaderMap>>,
+}
+
+impl ServerState {
+    fn snapshot(&self) -> AppState {
+        let codex_headers = self.codex_auth.borrow().clone();
+        let config = self.config.borrow().clone();
+        let config = if codex_headers.is_some() {
+            Arc::new(config.as_ref().clone().with_codex(true))
+        } else {
+            config
+        };
+        AppState {
+            config,
+            client: self.client.clone(),
+            codex_headers,
+        }
+    }
 }
 
 pub fn app(config: Config) -> Router {
@@ -34,6 +53,13 @@ pub fn app(config: Config) -> Router {
 }
 
 fn app_with_config(config: watch::Receiver<Arc<Config>>) -> Router {
+    app_with_auth(config, codex::watch_auth(codex::auth_path()))
+}
+
+fn app_with_auth(
+    config: watch::Receiver<Arc<Config>>,
+    codex_auth: watch::Receiver<Option<HeaderMap>>,
+) -> Router {
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(15))
         .build()
@@ -41,7 +67,11 @@ fn app_with_config(config: watch::Receiver<Arc<Config>>) -> Router {
             warn!(target: "llmapi", error = %err, "failed to configure upstream client");
             reqwest::Client::new()
         });
-    let state = ServerState { config, client };
+    let state = ServerState {
+        config,
+        client,
+        codex_auth,
+    };
 
     Router::new()
         .route("/providers", get(providers))
@@ -77,7 +107,7 @@ async fn require_api_key(
 }
 
 async fn providers(State(state): State<ServerState>) -> impl IntoResponse {
-    let mut config = state.config.borrow().as_ref().clone();
+    let mut config = state.snapshot().config.as_ref().clone();
     for provider in config.providers.values_mut() {
         if provider.api_key.is_some() {
             provider.api_key = Some("***".into());
@@ -113,7 +143,13 @@ pub(crate) async fn serve_reloading(
     );
     tokio::pin!(watcher);
     let (mut shutdown, shutdown_receiver) = oneshot::channel();
-    let mut server = Box::pin(run_server(listener, receiver.clone(), shutdown_receiver));
+    let codex_auth = codex::watch_auth(codex::auth_path());
+    let mut server = Box::pin(run_server(
+        listener,
+        receiver.clone(),
+        codex_auth.clone(),
+        shutdown_receiver,
+    ));
     let mut retry = tokio::time::interval(Duration::from_millis(500));
     let mut last_bind_error = None;
 
@@ -154,7 +190,12 @@ pub(crate) async fn serve_reloading(
         let (next_shutdown, shutdown_receiver) = oneshot::channel();
         let old_server = std::mem::replace(
             &mut server,
-            Box::pin(run_server(listener, receiver.clone(), shutdown_receiver)),
+            Box::pin(run_server(
+                listener,
+                receiver.clone(),
+                codex_auth.clone(),
+                shutdown_receiver,
+            )),
         );
         tokio::spawn(async move {
             if let Err(err) = old_server.await {
@@ -170,9 +211,10 @@ pub(crate) async fn serve_reloading(
 async fn run_server(
     listener: tokio::net::TcpListener,
     config: watch::Receiver<Arc<Config>>,
+    codex_auth: watch::Receiver<Option<HeaderMap>>,
     shutdown: oneshot::Receiver<()>,
 ) -> Result<()> {
-    axum::serve(listener, app_with_config(config))
+    axum::serve(listener, app_with_auth(config, codex_auth))
         .with_graceful_shutdown(async {
             let _ = shutdown.await;
         })
@@ -259,15 +301,13 @@ fn handler(
         .body(body)
         .expect("request builder with existing uri");
 
-    let snapshot = AppState {
-        config: state.config.borrow().clone(),
-        client: state.client.clone(),
-    };
+    let snapshot = state.snapshot();
     proxy::handle_with_websocket(snapshot, headers, request, ws.ok())
 }
 
 #[cfg(test)]
 mod tests {
+    mod codex_tests;
     use std::{collections::BTreeMap, convert::Infallible, fs, sync::Arc};
 
     use axum::{
@@ -491,7 +531,11 @@ mod tests {
         let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = proxy_listener.local_addr().unwrap();
         tokio::spawn(async move {
-            axum::serve(proxy_listener, app(config)).await.unwrap();
+            let (_, config) = watch::channel(Arc::new(config));
+            let (_, auth) = watch::channel(None);
+            axum::serve(proxy_listener, app_with_auth(config, auth))
+                .await
+                .unwrap();
         });
         address
     }
@@ -524,9 +568,12 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server_receiver = receiver.clone();
         tokio::spawn(async move {
-            axum::serve(listener, app_with_config(server_receiver))
-                .await
-                .unwrap();
+            axum::serve(
+                listener,
+                app_with_auth(server_receiver, watch::channel(None).1),
+            )
+            .await
+            .unwrap();
         });
         let client = reqwest::Client::new();
         let list_models = || client.get(format!("http://{address}/models"));

@@ -15,7 +15,7 @@ use super::{
         openai_responses::OpenAiResponsesAdapter, AdapterError, RequestAdapter, ResponseAdapter,
         SseDecoder, SseEvent, StreamAdapter, StreamState,
     },
-    auth,
+    auth, codex,
     config::{Provider, ProviderConfig},
     model::{LLMRequest, LLMResponse},
     models,
@@ -122,6 +122,14 @@ pub async fn handle_with_websocket(
             );
         }
     };
+    if provider.provider_type == Provider::Codex && state.codex_headers.is_none() {
+        return protocol_error_response(
+            &route.input,
+            StatusCode::BAD_GATEWAY,
+            "Codex ChatGPT credentials are unavailable",
+            "api_error",
+        );
+    }
     provider.api_key = match provider.api_key() {
         Ok(api_key) => api_key,
         Err(err) => {
@@ -135,7 +143,17 @@ pub async fn handle_with_websocket(
     };
     if route.input == InputFormat::Models {
         let codex_client = models::is_codex_client(&headers, query.as_deref());
-        let url = upstream_url(&provider.base_url, "/models", query.as_deref());
+        let mut url = upstream_url(&provider.base_url, "/models", query.as_deref());
+        if provider.provider_type == Provider::Codex
+            && !query.as_deref().is_some_and(|query| {
+                url::form_urlencoded::parse(query.as_bytes())
+                    .any(|(key, _)| key == "client_version")
+            })
+        {
+            url.push(if url.contains('?') { '&' } else { '?' });
+            url.push_str("client_version=");
+            url.push_str(codex::CLIENT_VERSION);
+        }
         return match send_upstream_request(
             state,
             provider,
@@ -170,7 +188,7 @@ pub async fn handle_with_websocket(
     let input = route.input;
     let (upstream, path) = upstream_for(provider.provider_type);
 
-    if is_transparent(input, upstream) {
+    if provider.provider_type != Provider::Codex && is_transparent(input, upstream) {
         debug!(target: "llmapi", path, "transparent proxy");
         return forward_raw(
             state,
@@ -386,7 +404,7 @@ pub fn forward_raw(
     let upstream_method = method.as_str().to_string();
     let input = match provider.provider_type {
         Provider::OpenAiChat => InputFormat::OpenAiChat,
-        Provider::OpenAiResponses => InputFormat::OpenAiResponses,
+        Provider::OpenAiResponses | Provider::Codex => InputFormat::OpenAiResponses,
         Provider::Anthropic => InputFormat::AnthropicMessages,
     };
     send_upstream_request(state, provider, headers, method, query, &url, body).map(move |result| {
@@ -436,6 +454,11 @@ fn send_upstream_request(
         extracted.as_deref(),
     );
     auth::apply_protocol_headers(&mut upstream_headers, provider.provider_type, headers);
+    if provider.provider_type == Provider::Codex {
+        if let Some(auth) = &state.codex_headers {
+            codex::apply_headers(&mut upstream_headers, auth, method == Method::POST);
+        }
+    }
     if method == Method::GET {
         if let Some(etag) = headers.get(header::IF_NONE_MATCH) {
             upstream_headers.insert(header::IF_NONE_MATCH, etag.clone());
@@ -470,9 +493,50 @@ async fn convert_and_forward(forward: ForwardRequest<'_>) -> Response<Body> {
             );
         }
     };
-    let llm_request = match input_to_llm(forward.input, input_json) {
-        Ok(request) => request,
-        Err(err) => {
+    let is_codex = forward.provider.provider_type == Provider::Codex;
+    let client_stream = input_json["stream"].as_bool().unwrap_or(false);
+    let mut upstream_json = if is_codex && *forward.input == InputFormat::OpenAiResponses {
+        input_json
+    } else {
+        let llm_request = match input_to_llm(forward.input, input_json) {
+            Ok(request) => request,
+            Err(err) => {
+                return protocol_error_response(
+                    forward.input,
+                    StatusCode::BAD_REQUEST,
+                    &err.to_string(),
+                    "invalid_request_error",
+                );
+            }
+        };
+        debug!(
+            target: "llmapi",
+            source = ?llm_request.source,
+            model = %llm_request.model,
+            stream = llm_request.stream,
+            messages = llm_request.messages.len(),
+            tools = llm_request.tools.len(),
+            "normalized LLM request"
+        );
+        match llm_to_upstream(forward.upstream, &llm_request) {
+            Ok(value) => value,
+            Err(err) => {
+                let (status, error_type) = if matches!(&err, AdapterError::Unsupported(_)) {
+                    (StatusCode::BAD_REQUEST, "invalid_request_error")
+                } else {
+                    (StatusCode::BAD_GATEWAY, "api_error")
+                };
+                return protocol_error_response(
+                    forward.input,
+                    status,
+                    &err.to_string(),
+                    error_type,
+                );
+            }
+        }
+    };
+    if is_codex {
+        if let Err(err) = codex::prepare_request(&mut upstream_json) {
             return protocol_error_response(
                 forward.input,
                 StatusCode::BAD_REQUEST,
@@ -480,33 +544,24 @@ async fn convert_and_forward(forward: ForwardRequest<'_>) -> Response<Body> {
                 "invalid_request_error",
             );
         }
-    };
-    debug!(
-        target: "llmapi",
-        source = ?llm_request.source,
-        model = %llm_request.model,
-        stream = llm_request.stream,
-        messages = llm_request.messages.len(),
-        tools = llm_request.tools.len(),
-        "normalized LLM request"
-    );
-    let upstream_json = match llm_to_upstream(forward.upstream, &llm_request) {
-        Ok(value) => value,
-        Err(err) => {
-            let (status, error_type) = if matches!(&err, AdapterError::Unsupported(_)) {
-                (StatusCode::BAD_REQUEST, "invalid_request_error")
-            } else {
-                (StatusCode::BAD_GATEWAY, "api_error")
-            };
-            return protocol_error_response(forward.input, status, &err.to_string(), error_type);
-        }
-    };
+    }
 
+    let mut headers = forward.headers.clone();
+    if is_codex {
+        // Derive session headers before serialization; image/tool inputs can be large.
+        if let Some(key) = upstream_json["prompt_cache_key"]
+            .as_str()
+            .and_then(|key| HeaderValue::from_str(key).ok())
+        {
+            headers.insert("session-id", key.clone());
+            headers.insert("thread-id", key);
+        }
+    }
     let url = upstream_url(&forward.provider.base_url, forward.path, forward.query);
     let upstream_response = match send_upstream_request(
         forward.state.clone(),
         forward.provider,
-        forward.headers,
+        &headers,
         Method::POST,
         forward.query,
         &url,
@@ -535,7 +590,94 @@ async fn convert_and_forward(forward: ForwardRequest<'_>) -> Response<Body> {
     if forward.upstream_raw {
         return raw_upstream_response(upstream_response);
     }
+    if is_codex {
+        return codex_response(upstream_response, forward.input, client_stream).await;
+    }
     convert_response_back(upstream_response, forward.input, forward.upstream).await
+}
+
+async fn codex_response(
+    upstream: reqwest::Response,
+    input: &InputFormat,
+    stream: bool,
+) -> Response<Body> {
+    if !upstream.status().is_success() {
+        return converted_error_response(upstream, input).await;
+    }
+    if stream {
+        return if *input == InputFormat::OpenAiResponses {
+            raw_upstream_response(upstream)
+        } else {
+            converted_sse_response(upstream, *input, UpstreamFormat::OpenAiResponses)
+        };
+    }
+    let headers = upstream.headers().clone();
+    match collect_codex_response(upstream).await {
+        Ok(value) if *input == InputFormat::OpenAiResponses => {
+            let mut result = response(
+                StatusCode::OK,
+                Bytes::from(value.to_string()),
+                "application/json",
+            );
+            copy_response_metadata_headers(&headers, result.headers_mut());
+            result
+        }
+        Ok(value) => {
+            converted_json_response(value, input, UpstreamFormat::OpenAiResponses, &headers)
+        }
+        Err(err) => {
+            let mut result =
+                protocol_error_response(input, StatusCode::BAD_GATEWAY, &err, "api_error");
+            copy_response_metadata_headers(&headers, result.headers_mut());
+            result
+        }
+    }
+}
+
+async fn collect_codex_response(upstream: reqwest::Response) -> Result<Value, String> {
+    let mut stream = upstream.bytes_stream();
+    let mut decoder = SseDecoder::default();
+    let mut size = 0;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|err| err.to_string())?;
+        size += chunk.len();
+        if size > MAX_JSON_BODY_BYTES {
+            return Err("Codex response exceeds the buffered response limit".into());
+        }
+        for event in decoder.push(&chunk).map_err(|err| err.to_string())? {
+            if let Some(response) = codex_terminal_response(&event)? {
+                return Ok(response);
+            }
+        }
+    }
+    for event in decoder.finish().map_err(|err| err.to_string())? {
+        if let Some(response) = codex_terminal_response(&event)? {
+            return Ok(response);
+        }
+    }
+    Err("Codex stream ended before a terminal event".into())
+}
+
+fn codex_terminal_response(event: &SseEvent) -> Result<Option<Value>, String> {
+    if event.data.is_empty() || event.data == "[DONE]" {
+        return Ok(None);
+    }
+    let mut value: Value = serde_json::from_str(&event.data).map_err(|err| err.to_string())?;
+    match value["type"].as_str().or(event.event.as_deref()) {
+        Some("response.completed" | "response.incomplete") => {
+            if !value["response"].is_object() {
+                return Err("Codex terminal event has no response object".into());
+            }
+            Ok(Some(value["response"].take()))
+        }
+        Some("response.failed" | "error") => Err(value["response"]["error"]["message"]
+            .as_str()
+            .or_else(|| value["error"]["message"].as_str())
+            .or_else(|| value["message"].as_str())
+            .unwrap_or("Codex response failed")
+            .to_owned()),
+        _ => Ok(None),
+    }
 }
 
 fn input_to_llm(input: &InputFormat, value: Value) -> Result<LLMRequest, AdapterError> {
@@ -632,6 +774,15 @@ async fn convert_response_back(
             );
         }
     };
+    converted_json_response(value, input, upstream, &response_headers)
+}
+
+fn converted_json_response(
+    value: Value,
+    input: &InputFormat,
+    upstream: UpstreamFormat,
+    response_headers: &HeaderMap,
+) -> Response<Body> {
     let llm = match upstream_to_llm(upstream, value) {
         Ok(value) => value,
         Err(err) => {
@@ -669,7 +820,7 @@ async fn convert_response_back(
         Bytes::from(serde_json::to_vec(&output).unwrap()),
         "application/json",
     );
-    copy_response_metadata_headers(&response_headers, response.headers_mut());
+    copy_response_metadata_headers(response_headers, response.headers_mut());
     response
 }
 
