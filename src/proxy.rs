@@ -697,7 +697,7 @@ fn llm_to_upstream(upstream: UpstreamFormat, request: &LLMRequest) -> Result<Val
     }
 }
 
-fn upstream_url(base_url: &str, path: &str, query: Option<&str>) -> String {
+pub(crate) fn upstream_url(base_url: &str, path: &str, query: Option<&str>) -> String {
     let base_url = base_url.trim_end_matches('/');
     let endpoint = if base_url.ends_with(path) {
         base_url.to_string()

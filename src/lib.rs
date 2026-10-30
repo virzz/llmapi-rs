@@ -17,12 +17,15 @@ use std::{
     io::{self, IsTerminal},
     net::SocketAddr,
     path::{Path, PathBuf},
+    time::{Duration, Instant},
 };
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
+use axum::http::{header, HeaderMap, Method};
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use clap_complete::{generate, Shell};
 use comfy_table::Table;
+use serde_json::{json, Value};
 
 use config::{Config, Provider, ProviderConfig};
 
@@ -47,11 +50,8 @@ enum Command {
     },
     /// List configured providers
     List,
-    /// Show the current default provider
-    Status,
-    /// Select the default provider
-    #[command(visible_alias = "default")]
-    Select(ProviderArgs),
+    /// Check that a provider is reachable
+    Check(CheckArgs),
     /// Add a provider
     Add(AddArgs),
     /// Remove a provider
@@ -91,9 +91,15 @@ struct RemoveArgs {
 }
 
 #[derive(Debug, Args)]
-struct ProviderArgs {
-    /// Provider name
-    provider: String,
+struct CheckArgs {
+    /// Provider name (defaults to the configured default)
+    provider: Option<String>,
+    /// Send a minimal completion request with this model instead of listing models
+    #[arg(long)]
+    model: Option<String>,
+    /// Request timeout in seconds
+    #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..))]
+    timeout: u64,
 }
 
 #[derive(Debug, Args)]
@@ -171,9 +177,37 @@ impl Cmd {
         Ok(())
     }
 
-    fn status(&self) -> Result<()> {
-        let config = self.load_config()?.with_codex(codex::available());
-        print!("{}", format_default_provider(&config));
+    async fn check(&self, args: &CheckArgs) -> Result<()> {
+        let codex_headers =
+            codex::auth_path().and_then(|path| codex::read_auth(&path).ok().flatten());
+        let config = self.load_config()?.with_codex(codex_headers.is_some());
+        if config.providers.is_empty() {
+            bail!("no providers configured");
+        }
+        let (name, provider) = config.provider(args.provider.as_deref())?;
+        let (name, provider) = (name.to_owned(), provider.clone());
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(15))
+            .timeout(Duration::from_secs(args.timeout))
+            .build()
+            .context("build HTTP client")?;
+        let probe = if args.model.is_some() {
+            "model"
+        } else {
+            "models"
+        };
+        let outcome = probe_provider(
+            &client,
+            &provider,
+            codex_headers.as_ref(),
+            args.model.as_deref(),
+        )
+        .await
+        .with_context(|| format!("check provider {name}"))?;
+        print!("{}", format_check_report(&name, &provider, probe, &outcome));
+        if !outcome.status.is_success() {
+            bail!("provider {name} check failed: {}", outcome.status);
+        }
         Ok(())
     }
 
@@ -234,16 +268,6 @@ impl Cmd {
         Ok(())
     }
 
-    fn select(&self, args: &ProviderArgs) -> Result<()> {
-        let path = self.config_path();
-        let mut config = self.load_config()?;
-        config.set_default(&args.provider)?;
-        config
-            .save(&path)
-            .with_context(|| format!("save config {}", path.display()))?;
-        Ok(())
-    }
-
     fn load_config(&self) -> Result<Config> {
         let path = self.config_path();
         let result = if self.config.is_some() {
@@ -280,8 +304,7 @@ impl Cmd {
                 Ok(())
             }
             Command::List => self.list(),
-            Command::Status => self.status(),
-            Command::Select(args) => self.select(args),
+            Command::Check(args) => self.check(args).await,
             Command::Add(args) => self.add(args),
             Command::Remove(args) => self.remove(args),
             Command::Set(args) => self.set(args),
@@ -306,13 +329,218 @@ fn format_provider_list(config: &Config) -> String {
     format!("{table}\n")
 }
 
-fn format_default_provider(config: &Config) -> String {
-    format!("{}\n", config.default)
+#[derive(Debug)]
+struct CheckOutcome {
+    status: reqwest::StatusCode,
+    latency: Duration,
+    detail: String,
+}
+
+async fn probe_provider(
+    client: &reqwest::Client,
+    provider: &ProviderConfig,
+    codex_headers: Option<&HeaderMap>,
+    model: Option<&str>,
+) -> Result<CheckOutcome> {
+    let api_key = provider.api_key()?;
+    let mut headers = HeaderMap::new();
+    auth::apply_api_key(
+        &mut headers,
+        provider.provider_type,
+        api_key.as_deref(),
+        None,
+    );
+    auth::apply_protocol_headers(&mut headers, provider.provider_type, &HeaderMap::new());
+
+    let codex = provider.provider_type == Provider::Codex;
+    let (method, path, body) = match (provider.provider_type, model) {
+        (_, None) => (Method::GET, "/models", None),
+        (Provider::OpenAiChat, Some(model)) => (
+            Method::POST,
+            "/chat/completions",
+            Some(json!({
+                "model": model,
+                "messages": [{"role": "user", "content": "ping"}],
+                "stream": false
+            })),
+        ),
+        (Provider::OpenAiResponses, Some(model)) => (
+            Method::POST,
+            "/responses",
+            Some(json!({
+                "model": model,
+                "input": "ping",
+                "stream": false
+            })),
+        ),
+        (Provider::Anthropic, Some(model)) => (
+            Method::POST,
+            "/messages",
+            Some(json!({
+                "model": model,
+                "max_tokens": 16,
+                "messages": [{"role": "user", "content": "ping"}]
+            })),
+        ),
+        (Provider::Codex, Some(model)) => {
+            let mut body = json!({"model": model, "input": "ping"});
+            codex::prepare_request(&mut body)?;
+            (Method::POST, "/responses", Some(body))
+        }
+    };
+    if codex {
+        let auth = codex_headers.context("Codex credentials are unavailable")?;
+        codex::apply_headers(&mut headers, auth, model.is_some());
+    }
+    let body = body
+        .map(|body| serde_json::to_vec(&body))
+        .transpose()
+        .context("serialize probe request")?;
+    let mut url = proxy::upstream_url(&provider.base_url, path, None);
+    if codex && model.is_none() {
+        url.push(if url.contains('?') { '&' } else { '?' });
+        url.push_str("client_version=");
+        url.push_str(codex::CLIENT_VERSION);
+    }
+
+    let request = client
+        .request(method, &url)
+        .headers(headers)
+        .header(header::CONTENT_TYPE, "application/json");
+    let request = match body {
+        Some(body) => request.body(body),
+        None => request,
+    };
+    let started = Instant::now();
+    let mut response = request
+        .send()
+        .await
+        .with_context(|| format!("request upstream {url}"))?;
+    let latency = started.elapsed();
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.bytes().await.unwrap_or_default();
+        return Ok(CheckOutcome {
+            status,
+            latency,
+            detail: compact_text(&body),
+        });
+    }
+
+    let detail = match (model, codex) {
+        (None, _) => {
+            let body = response.bytes().await.context("read upstream response")?;
+            serde_json::from_slice::<Value>(&body)
+                .ok()
+                .and_then(|value| model_count(&value))
+                .map(|count| format!("{count} models"))
+                .unwrap_or_else(|| "reachable".into())
+        }
+        (Some(_), true) => match response.chunk().await.context("read upstream stream")? {
+            Some(chunk) => format!("stream received ({} bytes)", chunk.len()),
+            None => "empty stream".into(),
+        },
+        (Some(_), false) => {
+            let body = response.bytes().await.context("read upstream response")?;
+            response_text(provider.provider_type, &body)
+                .map(|text| format!("reply: {text}"))
+                .unwrap_or_else(|| "reachable".into())
+        }
+    };
+    Ok(CheckOutcome {
+        status,
+        latency,
+        detail,
+    })
+}
+
+fn model_count(value: &Value) -> Option<usize> {
+    value
+        .get("data")
+        .or_else(|| value.get("models"))?
+        .as_array()
+        .map(Vec::len)
+}
+
+fn response_text(provider: Provider, body: &[u8]) -> Option<String> {
+    let value: Value = serde_json::from_slice(body).ok()?;
+    let text =
+        match provider {
+            Provider::OpenAiChat => json_text(&value["choices"][0]["message"]["content"]),
+            Provider::OpenAiResponses => value
+                .get("output_text")
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+                .or_else(|| {
+                    value.get("output")?.as_array()?.iter().find_map(|item| {
+                        item.get("content")?.as_array()?.iter().find_map(json_text)
+                    })
+                }),
+            Provider::Anthropic => value.get("content")?.as_array()?.iter().find_map(json_text),
+            Provider::Codex => None,
+        }?;
+    Some(truncate(&collapse(&text), 80))
+}
+
+fn json_text(value: &Value) -> Option<String> {
+    value.as_str().map(ToString::to_string).or_else(|| {
+        value
+            .as_array()?
+            .iter()
+            .find_map(|part| part.get("text")?.as_str().map(ToString::to_string))
+    })
+}
+
+fn compact_text(body: &[u8]) -> String {
+    let text = collapse(&String::from_utf8_lossy(body));
+    if text.is_empty() {
+        "empty response".into()
+    } else {
+        truncate(&text, 240)
+    }
+}
+
+fn collapse(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn truncate(text: &str, limit: usize) -> String {
+    if text.chars().count() <= limit {
+        return text.to_string();
+    }
+    let mut output: String = text.chars().take(limit).collect();
+    output.push_str("...");
+    output
+}
+
+fn format_check_report(
+    name: &str,
+    provider: &ProviderConfig,
+    probe: &str,
+    outcome: &CheckOutcome,
+) -> String {
+    let status = outcome.status.to_string();
+    let latency = format!("{} ms", outcome.latency.as_millis());
+    let mut table = Table::new();
+    table.set_header(["PROVIDER", "TYPE", "PROBE", "STATUS", "LATENCY", "DETAIL"]);
+    table.add_row([
+        name,
+        provider.provider_type.as_str(),
+        probe,
+        &status,
+        &latency,
+        &outcome.detail,
+    ]);
+    format!("{table}\n")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{
+        routing::{get, post},
+        Json, Router,
+    };
     use std::{collections::BTreeMap, fs};
     use tempfile::tempdir;
 
@@ -417,16 +645,29 @@ mod tests {
             Command::List
         ));
         assert!(matches!(
-            Cmd::parse_from(["llmapi", "status"]).command,
-            Command::Status
+            Cmd::parse_from(["llmapi", "check"]).command,
+            Command::Check(CheckArgs {
+                provider: None,
+                model: None,
+                timeout: 30,
+            })
         ));
         assert!(matches!(
-            Cmd::parse_from(["llmapi", "select", "deepseek"]).command,
-            Command::Select(ProviderArgs { .. })
-        ));
-        assert!(matches!(
-            Cmd::parse_from(["llmapi", "default", "deepseek"]).command,
-            Command::Select(ProviderArgs { .. })
+            Cmd::parse_from([
+                "llmapi",
+                "check",
+                "deepseek",
+                "--model",
+                "deepseek-chat",
+                "--timeout",
+                "5",
+            ])
+            .command,
+            Command::Check(CheckArgs {
+                provider: Some(_),
+                model: Some(_),
+                timeout: 5,
+            })
         ));
         let add = Cmd::parse_from([
             "llmapi",
@@ -539,69 +780,6 @@ mod tests {
         let config = Config::load(path).unwrap();
         assert_eq!(config.default, "openai");
         assert_eq!(config.providers.len(), 2);
-    }
-
-    #[test]
-    fn select_and_default_commands_persist_config() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("llmapi.yaml");
-        let mut config = Config::default();
-        config
-            .add_provider(
-                "first".into(),
-                ProviderConfig {
-                    provider_type: Provider::OpenAiChat,
-                    base_url: "https://first.test".into(),
-                    api_key: None,
-                },
-            )
-            .unwrap();
-        config
-            .add_provider(
-                "second".into(),
-                ProviderConfig {
-                    provider_type: Provider::OpenAiChat,
-                    base_url: "https://second.test".into(),
-                    api_key: None,
-                },
-            )
-            .unwrap();
-        config.save(&path).unwrap();
-
-        let select = Cmd::parse_from([
-            "llmapi",
-            "--config",
-            path.to_str().unwrap(),
-            "select",
-            "second",
-        ]);
-        let Command::Select(args) = &select.command else {
-            unreachable!()
-        };
-        select.select(args).unwrap();
-        assert_eq!(Config::load(&path).unwrap().default, "second");
-
-        let default = Cmd::parse_from([
-            "llmapi",
-            "--config",
-            path.to_str().unwrap(),
-            "default",
-            "first",
-        ]);
-        let Command::Select(args) = &default.command else {
-            unreachable!()
-        };
-        default.select(args).unwrap();
-        assert_eq!(Config::load(&path).unwrap().default, "first");
-    }
-
-    #[test]
-    fn status_uses_configured_default_provider() {
-        let config = Config {
-            default: "deepseek".into(),
-            ..Config::default()
-        };
-        assert_eq!(format_default_provider(&config), "deepseek\n");
     }
 
     #[test]
@@ -747,5 +925,102 @@ mod tests {
 
         assert!(cmd.set(args).is_err());
         assert_eq!(fs::read_to_string(path).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn check_models_probe_reports_model_count() {
+        let upstream = spawn_upstream(Router::new().route(
+            "/v1/models",
+            get(|headers: HeaderMap| async move {
+                assert_eq!(
+                    headers[header::AUTHORIZATION].to_str().unwrap(),
+                    "Bearer sk-test"
+                );
+                Json(json!({"data": [{"id": "one"}, {"id": "two"}]}))
+            }),
+        ))
+        .await;
+        let provider = ProviderConfig {
+            provider_type: Provider::OpenAiChat,
+            base_url: format!("{upstream}/v1"),
+            api_key: Some("sk-test".into()),
+        };
+
+        let outcome = probe_provider(&reqwest::Client::new(), &provider, None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.status.as_u16(), 200);
+        assert_eq!(outcome.detail, "2 models");
+    }
+
+    #[tokio::test]
+    async fn check_model_probe_uses_provider_protocol() {
+        let upstream = spawn_upstream(Router::new().route(
+            "/v1/chat/completions",
+            post(|headers: HeaderMap, Json(body): Json<Value>| async move {
+                assert_eq!(
+                    headers[header::AUTHORIZATION].to_str().unwrap(),
+                    "Bearer sk-test"
+                );
+                assert_eq!(body["model"], "deepseek-chat");
+                assert_eq!(body["messages"][0]["content"], "ping");
+                assert_eq!(body["stream"], false);
+                Json(json!({"choices": [{"message": {"content": "pong"}}]}))
+            }),
+        ))
+        .await;
+        let provider = ProviderConfig {
+            provider_type: Provider::OpenAiChat,
+            base_url: format!("{upstream}/v1"),
+            api_key: Some("sk-test".into()),
+        };
+
+        let outcome = probe_provider(
+            &reqwest::Client::new(),
+            &provider,
+            None,
+            Some("deepseek-chat"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.status.as_u16(), 200);
+        assert_eq!(outcome.detail, "reply: pong");
+    }
+
+    #[tokio::test]
+    async fn check_failure_reports_status_and_error_body() {
+        let upstream = spawn_upstream(Router::new().route(
+            "/v1/models",
+            get(|| async {
+                (
+                    axum::http::StatusCode::UNAUTHORIZED,
+                    Json(json!({"error": {"message": "bad key"}})),
+                )
+            }),
+        ))
+        .await;
+        let provider = ProviderConfig {
+            provider_type: Provider::OpenAiChat,
+            base_url: format!("{upstream}/v1"),
+            api_key: Some("sk-test".into()),
+        };
+
+        let outcome = probe_provider(&reqwest::Client::new(), &provider, None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.status.as_u16(), 401);
+        assert!(outcome.detail.contains("bad key"));
+    }
+
+    async fn spawn_upstream(router: axum::Router) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        format!("http://{addr}")
     }
 }

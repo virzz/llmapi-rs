@@ -7,8 +7,7 @@ Completions, OpenAI Responses, and Anthropic Messages APIs.
 
 ```bash
 llmapi list
-llmapi status
-llmapi select <provider> # alias: default
+llmapi check [provider] [--model <model>] [--timeout <seconds>]
 llmapi completion [bash|elvish|fish|powershell|zsh] # alias: comp
 llmapi add <name> --type <chat|responses|messages> --baseurl <url> [--apikey|--apikey-stdin]
 llmapi rm <name>
@@ -17,6 +16,14 @@ llmapi server [--server 127.0.0.1:8080] [--default <provider>]
 llmapi daemon install [--workdir <path>] [--args server ...]
 llmapi daemon start|stop|restart|status|uninstall|remove
 ```
+
+`check` probes a provider without starting the server. It uses the provider
+named by the argument, or the configured default when omitted. Without
+`--model`, it requests `GET /models` and reports the model count; with
+`--model`, it sends a minimal completion request instead. The command prints
+the provider, status, latency, and a short response summary, then exits with a
+non-zero status for transport errors or non-2xx responses. `--timeout` defaults
+to 30 seconds. Codex checks use the local Codex login.
 
 `completion` writes a shell completion script to stdout. With no shell
 argument, it uses the current shell when detected, or Bash otherwise.
@@ -91,7 +98,7 @@ credentials disable the automatic provider on the next poll.
 ```bash
 llmapi server
 # Or select Codex as the default without adding a provider entry:
-llmapi select codex
+llmapi set default codex
 ```
 
 Use `/codex/responses`, `/codex/chat/completions`, `/codex/messages`, and
