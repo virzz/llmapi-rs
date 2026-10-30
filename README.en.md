@@ -1,0 +1,145 @@
+# LLMApi
+
+English | [简体中文](README.md)
+
+`llmapi` is a standalone Rust CLI and HTTP proxy that converts between OpenAI Chat
+Completions, OpenAI Responses, and Anthropic Messages APIs.
+
+## Commands
+
+```bash
+llmapi list
+llmapi check [provider] [--model <model>] [--timeout <seconds>]
+llmapi completion [bash|elvish|fish|powershell|zsh] # alias: comp
+llmapi add <name> --type <chat|responses|messages> --baseurl <url> [--apikey|--apikey-stdin]
+llmapi rm <name>
+llmapi set default <provider>
+llmapi server [--server 127.0.0.1:8080] [--default <provider>]
+llmapi daemon install [--workdir <path>] [--args server ...]
+llmapi daemon start|stop|restart|status|uninstall|remove
+```
+
+`check` probes a provider without starting the server. It uses the provider
+named by the argument, or the configured default when omitted. Without
+`--model`, it requests `GET /models` and reports the model count; with
+`--model`, it sends a minimal completion request instead. The command prints
+the provider, status, latency, and a short response summary, then exits with a
+non-zero status for transport errors or non-2xx responses. `--timeout` defaults
+to 30 seconds. Codex checks use the local Codex login.
+
+`completion` writes a shell completion script to stdout. With no shell
+argument, it uses the current shell when detected, or Bash otherwise.
+
+`add --apikey` prompts without echoing the key. For piped input, use
+`printf '%s\n' "$API_KEY" | llmapi add <name> --type chat --baseurl <url> --apikey-stdin`.
+`add` rejects empty keys and plaintext key arguments. Omit both flags to leave
+the upstream key unset. `remove` (alias `rm`) deletes a provider; deleting the
+default selects the first remaining provider by name. The last provider can
+also be removed. Saved provider keys remain in the config file as plaintext.
+
+On macOS, `daemon install` writes a user LaunchAgent to
+`~/Library/LaunchAgents/com.virzz.enyo.llmapi.plist`. The default working
+directory is the current directory and the default argument is `server`.
+`--args` replaces the full argument list. Logs go to
+`~/Library/Logs/com.virzz.enyo.llmapi/`. Installation and removal only change
+files; use `daemon start` or `daemon stop` to change launchctl state. `remove`
+is an alias for `uninstall`; neither command deletes logs.
+`daemon restart` unloads and bootstraps the service to apply an updated plist.
+`daemon status` reports `not loaded` or `not installed` when launchctl has no
+matching service; other launchctl errors remain errors.
+
+Configuration is loaded from `--config <path>` when specified; otherwise from
+`./config.{toml,yaml,yml,json}` in that order, then
+`~/.config/enyo/llmapi.{yaml,toml,yml,json}` in that order. When none exists,
+the fallback path is `~/.config/enyo/llmapi.yaml`.
+An explicitly selected file never falls back; `add` can create a new file there.
+The `server` command's `--server` and `--default` arguments override the selected
+file's listen address and default provider without modifying the file.
+Set top-level `apikey` (for example, `apikey: ${LLMAPI_API_KEY}`) to require a
+client key on every HTTP route. Clients can send `Authorization: Bearer <key>`,
+`x-api-key`, `api-key`, or the `key` query parameter. Missing or incorrect keys
+return 401. An unset top-level `apikey` keeps the server open; provider `apikey`
+values remain separate upstream credentials.
+Set top-level `access_log = true` (YAML: `access_log: true`) to write one access
+log line per HTTP request to stdout, including the client address, method and
+redacted path, response status, and handling latency. Access logs are written
+for every request, including rejected ones, and default to off. When the server
+reloads the config file, the setting takes effect for new requests.
+While running, the server checks the selected file every 500 ms and applies valid
+provider/default changes to new requests. Changes to `server` bind a new listener
+before closing the old one; if binding fails, the old listener remains and the
+server retries. CLI overrides remain in effect. Invalid or missing files keep
+the last valid config; changing the selected config path requires a restart.
+
+## HTTP routes
+
+| Client protocol    | Default provider    | Named provider                 |
+| ------------------ | ------------------- | ------------------------------ |
+| OpenAI Chat        | `/chat/completions` | `/{provider}/chat/completions` |
+| OpenAI Responses   | `/responses`        | `/{provider}/responses`        |
+| Anthropic Messages | `/messages`         | `/{provider}/messages`         |
+
+`/responses` also accepts a WebSocket upgrade when the selected provider uses
+`openai-responses`; WebSocket messages are forwarded transparently to that
+provider.
+
+`GET /models` and `GET /v1/models` (also under `/{provider}`) accept upstream
+OpenAI `data` or Codex `models` lists. Codex requests (identified by
+`client_version` or a Codex User-Agent) receive `models`; other clients receive
+OpenAI `data`. Missing metadata is synthesized when converting between formats.
+
+`GET /providers` returns the active default and all configured providers. Each
+configured `apikey` is returned as `***`; unset keys are omitted. The endpoint
+does not resolve environment variables or contact upstream providers.
+
+See [examples/config.yaml](examples/config.yaml) for the provider configuration format.
+
+## Codex ChatGPT provider
+
+`llmapi` automatically discovers `~/.codex/auth.json` when `auth_mode` is
+`chatgpt` and `tokens.access_token` is present. No provider entry or API key is
+needed. It reads the file at server startup and every **5 minutes**, including
+when the file does not yet exist. Missing, unreadable, invalid, or non-ChatGPT
+credentials disable the automatic provider on the next poll.
+
+```bash
+llmapi server
+# Or select Codex as the default without adding a provider entry:
+llmapi set default codex
+```
+
+Use `/codex/responses`, `/codex/chat/completions`, `/codex/messages`, and
+`/codex/models` (also with `/v1` after `/codex`). The automatic provider appears
+in `llmapi list` and `GET /providers`. Configured providers and their default
+remain in effect; a configured provider named `codex` takes precedence. With
+no config file or providers, Codex becomes the runtime default when available.
+An explicitly selected missing config file still returns an error.
+
+The proxy uses the local access token and account ID for
+`https://chatgpt.com/backend-api/codex`. It **never refreshes tokens or writes
+auth.json**. Keep the login managed by Codex; updates can take up to five
+minutes to reach llmapi. An upstream 401 is returned without retrying. Credentials
+are not written to llmapi config or exposed by the provider listing. Only the
+file at `~/.codex/auth.json` is used; Keychain-only logins are not discovered.
+
+Both streaming and non-streaming HTTP requests are supported. The backend
+always uses Responses SSE with `store=false`; non-streaming clients receive
+the final JSON response. Native Responses streams preserve upstream events.
+WebSocket requests are not supported for this provider.
+
+Codex requests omit unsupported sampling/output-limit fields (`temperature`,
+`top_p`, `stop`, `max_output_tokens`, and `max_completion_tokens`), including
+output limits converted from Chat or Messages. Those settings have no effect
+on the backend. `user`, `safety_identifier`, and `prompt_cache_options` are also
+omitted; only `priority` and `ultrafast` service tiers are forwarded. Stored
+conversation references (`previous_response_id`, `conversation`, and input
+`item_reference`) are rejected; send the full history instead. Model access
+and usage limits follow the ChatGPT account.
+
+## Development
+
+```bash
+cargo fmt --all -- --check
+cargo test
+cargo clippy --all-targets -- -D warnings
+```
