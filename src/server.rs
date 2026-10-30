@@ -1,9 +1,14 @@
-use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    net::SocketAddr,
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use anyhow::Result;
 use axum::{
     body::Body,
-    extract::{ws::WebSocketUpgrade, State},
+    extract::{ws::WebSocketUpgrade, ConnectInfo, State},
     http::{HeaderMap, Method, Request, Response, StatusCode, Uri},
     middleware::{self, Next},
     response::IntoResponse,
@@ -80,6 +85,7 @@ fn app_with_auth(
             state.clone(),
             require_api_key,
         ))
+        .layer(middleware::from_fn_with_state(state.clone(), access_log))
         .with_state(state)
 }
 
@@ -106,6 +112,36 @@ async fn require_api_key(
     }
 }
 
+async fn access_log(
+    State(state): State<ServerState>,
+    request: Request<Body>,
+    next: Next,
+) -> Response<Body> {
+    let enabled = state.config.borrow().access_log;
+    if !enabled {
+        return next.run(request).await;
+    }
+
+    let method = request.method().clone();
+    let uri = request.uri().clone();
+    let remote = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ConnectInfo(address)| address.to_string())
+        .unwrap_or_else(|| "-".into());
+    let started = Instant::now();
+    let response = next.run(request).await;
+    info!(
+        target: "llmapi::access",
+        remote = %remote,
+        request = %redact::request(method.as_str(), &uri),
+        status = response.status().as_u16(),
+        latency_ms = started.elapsed().as_millis() as u64,
+        "request completed"
+    );
+    response
+}
+
 async fn providers(State(state): State<ServerState>) -> impl IntoResponse {
     let mut config = state.snapshot().config.as_ref().clone();
     for provider in config.providers.values_mut() {
@@ -119,7 +155,11 @@ async fn providers(State(state): State<ServerState>) -> impl IntoResponse {
 pub async fn serve(addr: SocketAddr, config: Config) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     info!(target: "llmapi", address = %listener.local_addr()?, "server listening");
-    axum::serve(listener, app(config)).await?;
+    axum::serve(
+        listener,
+        app(config).into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
 
@@ -214,11 +254,14 @@ async fn run_server(
     codex_auth: watch::Receiver<Option<HeaderMap>>,
     shutdown: oneshot::Receiver<()>,
 ) -> Result<()> {
-    axum::serve(listener, app_with_auth(config, codex_auth))
-        .with_graceful_shutdown(async {
-            let _ = shutdown.await;
-        })
-        .await?;
+    axum::serve(
+        listener,
+        app_with_auth(config, codex_auth).into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async {
+        let _ = shutdown.await;
+    })
+    .await?;
     Ok(())
 }
 
@@ -496,6 +539,7 @@ mod tests {
     fn test_config(base_url: &str) -> Config {
         Config {
             server: "127.0.0.1:0".into(),
+            access_log: false,
             api_key: None,
             default: "deepseek".into(),
             providers: BTreeMap::from([

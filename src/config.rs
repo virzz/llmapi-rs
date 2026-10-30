@@ -9,6 +9,8 @@ const DEFAULT_SERVER: &str = "127.0.0.1:8080";
 pub struct Config {
     #[serde(default = "default_server")]
     pub server: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub access_log: bool,
     #[serde(
         default,
         rename = "apikey",
@@ -92,6 +94,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             server: default_server(),
+            access_log: false,
             api_key: None,
             default: String::new(),
             providers: BTreeMap::new(),
@@ -285,6 +288,10 @@ fn default_server() -> String {
     DEFAULT_SERVER.to_string()
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 fn validate_provider_name(name: &str) -> Result<(), ConfigError> {
     if !name.is_empty()
         && name
@@ -372,6 +379,30 @@ providers:
     baseurl: https://zzzzzzz
     apikey: sk-zzzzzzz
 "#;
+
+    #[test]
+    fn access_log_defaults_off_and_reads_true() {
+        assert!(!Config::default().access_log);
+        assert!(
+            !Config::parse(Path::new("llmapi.yaml"), CONFIG_YAML)
+                .unwrap()
+                .access_log
+        );
+
+        let yaml = format!("access_log: true\n{CONFIG_YAML}");
+        assert!(
+            Config::parse(Path::new("llmapi.yaml"), &yaml)
+                .unwrap()
+                .access_log
+        );
+
+        let toml = "access_log = true\n";
+        assert!(
+            Config::parse(Path::new("llmapi.toml"), toml)
+                .unwrap()
+                .access_log
+        );
+    }
 
     #[test]
     fn loads_multi_provider_yaml_and_aliases() {

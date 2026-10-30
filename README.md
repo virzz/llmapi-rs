@@ -58,6 +58,11 @@ client key on every HTTP route. Clients can send `Authorization: Bearer <key>`,
 `x-api-key`, `api-key`, or the `key` query parameter. Missing or incorrect keys
 return 401. An unset top-level `apikey` keeps the server open; provider `apikey`
 values remain separate upstream credentials.
+Set top-level `access_log = true` (YAML: `access_log: true`) to write one access
+log line per HTTP request to stdout, including the client address, method and
+redacted path, response status, and handling latency. Access logs are written
+for every request, including rejected ones, and default to off. When the server
+reloads the config file, the setting takes effect for new requests.
 While running, the server checks the selected file every 500 ms and applies valid
 provider/default changes to new requests. Changes to `server` bind a new listener
 before closing the old one; if binding fails, the old listener remains and the
