@@ -17,3 +17,7 @@ apikey = "${OPENAI_API_KEY}"
 type = "messages"
 baseurl = "https://api.anthropic.com/v1"
 apikey = "${ANTHROPIC_API_KEY}"
+
+[providers.pool]
+type = "lb"
+members = ["deepseek", "openai"]

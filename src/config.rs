@@ -1,9 +1,15 @@
-use std::{collections::BTreeMap, env, fs, path::Path, str::FromStr};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    env, fs,
+    path::Path,
+    str::FromStr,
+};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 const DEFAULT_SERVER: &str = "127.0.0.1:8080";
+pub const LB_TYPE: &str = "lb";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Config {
@@ -24,19 +30,38 @@ pub struct Config {
     pub providers: BTreeMap<String, ProviderConfig>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ProviderConfig {
-    #[serde(rename = "type")]
-    pub provider_type: Provider,
-    #[serde(rename = "baseurl", alias = "base_url")]
+/// A configured provider: either a real upstream or a load-balancer group.
+///
+/// The load-balancer variant intentionally has no address or credentials, so an
+/// LB can never be sent to as if it were an upstream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderConfig {
+    Upstream(UpstreamConfig),
+    Lb(LbConfig),
+}
+
+/// A real upstream that requests can be sent to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpstreamConfig {
+    /// Protocol spoken to the upstream. Never [`Protocol::Lb`]-like.
+    pub protocol: Protocol,
     pub base_url: String,
-    #[serde(
-        default,
-        rename = "apikey",
-        alias = "api_key",
-        skip_serializing_if = "Option::is_none"
-    )]
     pub api_key: Option<String>,
+}
+
+/// A round-robin load-balancer group over existing providers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LbConfig {
+    pub members: Vec<String>,
+}
+
+/// Concrete upstream protocols. There is deliberately no load-balancer variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Protocol {
+    OpenAiChat,
+    OpenAiResponses,
+    Anthropic,
+    Codex,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
@@ -54,6 +79,10 @@ pub enum Provider {
     #[serde(rename = "codex", skip_deserializing)]
     #[value(skip)]
     Codex,
+    /// Round-robin group over other providers.
+    #[serde(rename = "lb")]
+    #[value(name = "lb")]
+    Lb,
 }
 
 #[derive(Debug, Error)]
@@ -82,6 +111,18 @@ pub enum ConfigError {
     InvalidProviderName(String),
     #[error("server apikey cannot be empty")]
     EmptyServerApiKey,
+    #[error("lb provider `{0}` requires at least one member")]
+    EmptyLbMembers(String),
+    #[error("lb provider `{lb}` lists member `{member}` more than once")]
+    DuplicateLbMember { lb: String, member: String },
+    #[error("lb provider `{lb}` references unknown member `{member}`")]
+    LbMemberNotFound { lb: String, member: String },
+    #[error("lb provider `{0}` cannot reference itself")]
+    LbSelfReference(String),
+    #[error("lb provider `{lb}` cannot reference another lb `{member}`")]
+    NestedLb { lb: String, member: String },
+    #[error("provider `{provider}` is used by lb `{lb}`; update or remove that lb first")]
+    ProviderInUse { provider: String, lb: String },
     #[error("expand environment variable {name}: {source}")]
     EnvVar {
         name: String,
@@ -186,9 +227,25 @@ impl Config {
     }
 
     pub fn remove_provider(&mut self, name: &str) -> Result<(), ConfigError> {
-        if self.providers.remove(name).is_none() {
+        if !self.providers.contains_key(name) {
             return Err(ConfigError::ProviderNotFound(name.to_string()));
         }
+        if let Some(lb) = self
+            .providers
+            .iter()
+            .find_map(|(lb_name, provider)| match provider {
+                ProviderConfig::Lb(lb) if lb.members.iter().any(|member| member == name) => {
+                    Some(lb_name.clone())
+                }
+                _ => None,
+            })
+        {
+            return Err(ConfigError::ProviderInUse {
+                provider: name.to_string(),
+                lb,
+            });
+        }
+        self.providers.remove(name);
         if self.default == name {
             self.default = self.providers.keys().next().cloned().unwrap_or_default();
         }
@@ -205,13 +262,9 @@ impl Config {
 
     pub(crate) fn with_codex(mut self, available: bool) -> Self {
         if available {
-            self.providers
-                .entry("codex".into())
-                .or_insert_with(|| ProviderConfig {
-                    provider_type: Provider::Codex,
-                    base_url: crate::codex::BASE_URL.into(),
-                    api_key: None,
-                });
+            self.providers.entry("codex".into()).or_insert_with(|| {
+                ProviderConfig::upstream(Protocol::Codex, crate::codex::BASE_URL, None)
+            });
             if self.default.is_empty() {
                 self.default = "codex".into();
             }
@@ -240,11 +293,123 @@ impl Config {
         {
             return Err(ConfigError::DefaultProviderNotFound(self.default.clone()));
         }
+        for (name, provider) in &self.providers {
+            provider.validate(name, &self.providers)?;
+        }
         Ok(())
     }
 }
 
 impl ProviderConfig {
+    pub fn upstream(
+        protocol: Protocol,
+        base_url: impl Into<String>,
+        api_key: Option<String>,
+    ) -> Self {
+        Self::Upstream(UpstreamConfig {
+            protocol,
+            base_url: base_url.into(),
+            api_key,
+        })
+    }
+
+    pub fn lb(members: Vec<String>) -> Self {
+        Self::Lb(LbConfig { members })
+    }
+
+    pub fn protocol(&self) -> Option<Protocol> {
+        match self {
+            Self::Upstream(upstream) => Some(upstream.protocol),
+            Self::Lb(_) => None,
+        }
+    }
+
+    pub fn as_upstream(&self) -> Option<&UpstreamConfig> {
+        match self {
+            Self::Upstream(upstream) => Some(upstream),
+            Self::Lb(_) => None,
+        }
+    }
+
+    pub fn as_upstream_mut(&mut self) -> Option<&mut UpstreamConfig> {
+        match self {
+            Self::Upstream(upstream) => Some(upstream),
+            Self::Lb(_) => None,
+        }
+    }
+
+    pub fn as_lb(&self) -> Option<&LbConfig> {
+        match self {
+            Self::Lb(lb) => Some(lb),
+            Self::Upstream(_) => None,
+        }
+    }
+
+    pub fn api_key(&self) -> Result<Option<String>, ConfigError> {
+        match self {
+            Self::Upstream(upstream) => upstream.api_key(),
+            Self::Lb(_) => Ok(None),
+        }
+    }
+
+    fn normalize(&mut self) {
+        match self {
+            Self::Upstream(upstream) => upstream.normalize(),
+            Self::Lb(lb) => {
+                for member in &mut lb.members {
+                    *member = member.trim().to_string();
+                }
+            }
+        }
+    }
+
+    fn validate(
+        &self,
+        name: &str,
+        providers: &BTreeMap<String, ProviderConfig>,
+    ) -> Result<(), ConfigError> {
+        match self {
+            Self::Upstream(_) => {}
+            Self::Lb(lb) => {
+                if lb.members.is_empty() {
+                    return Err(ConfigError::EmptyLbMembers(name.to_string()));
+                }
+                let mut seen = BTreeSet::new();
+                for member in &lb.members {
+                    validate_provider_name(member)?;
+                    if member == name {
+                        return Err(ConfigError::LbSelfReference(name.to_string()));
+                    }
+                    if !seen.insert(member.clone()) {
+                        return Err(ConfigError::DuplicateLbMember {
+                            lb: name.to_string(),
+                            member: member.clone(),
+                        });
+                    }
+                    match providers.get(member) {
+                        Some(ProviderConfig::Lb(_)) => {
+                            return Err(ConfigError::NestedLb {
+                                lb: name.to_string(),
+                                member: member.clone(),
+                            });
+                        }
+                        Some(ProviderConfig::Upstream(_)) => {}
+                        None if member == "codex" => {}
+                        None => {
+                            return Err(ConfigError::LbMemberNotFound {
+                                lb: name.to_string(),
+                                member: member.clone(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl UpstreamConfig {
     pub fn api_key(&self) -> Result<Option<String>, ConfigError> {
         self.api_key.clone().map(expand_env).transpose()
     }
@@ -261,11 +426,44 @@ impl Provider {
             Self::OpenAiResponses => "openai-responses",
             Self::Anthropic => "anthropic",
             Self::Codex => "codex",
+            Self::Lb => LB_TYPE,
+        }
+    }
+
+    /// Protocol used to talk to a real upstream; `None` for the lb type.
+    pub const fn protocol(self) -> Option<Protocol> {
+        match self {
+            Self::OpenAiChat => Some(Protocol::OpenAiChat),
+            Self::OpenAiResponses => Some(Protocol::OpenAiResponses),
+            Self::Anthropic => Some(Protocol::Anthropic),
+            Self::Codex => Some(Protocol::Codex),
+            Self::Lb => None,
         }
     }
 }
 
+impl Protocol {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::OpenAiChat => "openai-chat",
+            Self::OpenAiResponses => "openai-responses",
+            Self::Anthropic => "anthropic",
+            Self::Codex => "codex",
+        }
+    }
+
+    const fn from_provider(provider: Provider) -> Option<Self> {
+        provider.protocol()
+    }
+}
+
 impl std::fmt::Display for Provider {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl std::fmt::Display for Protocol {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(self.as_str())
     }
@@ -279,7 +477,132 @@ impl FromStr for Provider {
             "openai-chat" | "chat" => Ok(Self::OpenAiChat),
             "openai-responses" | "responses" => Ok(Self::OpenAiResponses),
             "anthropic" | "messages" => Ok(Self::Anthropic),
+            LB_TYPE => Ok(Self::Lb),
             other => Err(ConfigError::UnknownProviderType(other.to_string())),
+        }
+    }
+}
+
+/// Keep "field is absent" distinct from "field is present with a null value" so
+/// type-specific field rules can reject explicitly supplied fields, including
+/// `null` in YAML/JSON.
+fn deserialize_present<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
+}
+
+/// Wire form used while deserializing, then split into upstream/lb.
+#[derive(Deserialize)]
+struct ProviderConfigRaw {
+    #[serde(rename = "type")]
+    provider_type: Provider,
+    #[serde(
+        rename = "baseurl",
+        alias = "base_url",
+        default,
+        deserialize_with = "deserialize_present"
+    )]
+    base_url: Option<Option<String>>,
+    #[serde(
+        rename = "apikey",
+        alias = "api_key",
+        default,
+        deserialize_with = "deserialize_present"
+    )]
+    api_key: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_present")]
+    members: Option<Option<Vec<String>>>,
+}
+
+impl ProviderConfigRaw {
+    fn into_config(self) -> Result<ProviderConfig, String> {
+        match self.provider_type {
+            Provider::Lb => {
+                if self.base_url.is_some() {
+                    return Err("lb provider does not accept `baseurl`".into());
+                }
+                if self.api_key.is_some() {
+                    return Err("lb provider does not accept `apikey`".into());
+                }
+                let members = match self.members {
+                    Some(Some(members)) => members,
+                    _ => return Err("lb provider requires `members`".into()),
+                };
+                Ok(ProviderConfig::lb(members))
+            }
+            provider_type => {
+                if self.members.is_some() {
+                    return Err(format!(
+                        "provider type `{provider_type}` does not accept `members`"
+                    ));
+                }
+                let base_url = match self.base_url {
+                    Some(Some(base_url)) => base_url,
+                    _ => {
+                        return Err(format!(
+                            "provider type `{provider_type}` requires `baseurl`"
+                        ))
+                    }
+                };
+                let protocol = Protocol::from_provider(provider_type)
+                    .ok_or_else(|| format!("unknown provider type: {provider_type}"))?;
+                Ok(ProviderConfig::upstream(
+                    protocol,
+                    base_url,
+                    self.api_key.flatten(),
+                ))
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ProviderConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        ProviderConfigRaw::deserialize(deserializer)?
+            .into_config()
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Serialize)]
+struct UpstreamWire<'a> {
+    #[serde(rename = "type")]
+    provider_type: &'a str,
+    baseurl: &'a str,
+    #[serde(rename = "apikey", skip_serializing_if = "Option::is_none")]
+    api_key: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+struct LbWire<'a> {
+    #[serde(rename = "type")]
+    provider_type: &'a str,
+    members: &'a [String],
+}
+
+impl Serialize for ProviderConfig {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            Self::Upstream(upstream) => UpstreamWire {
+                provider_type: upstream.protocol.as_str(),
+                baseurl: &upstream.base_url,
+                api_key: upstream.api_key.as_deref(),
+            }
+            .serialize(serializer),
+            Self::Lb(lb) => LbWire {
+                provider_type: LB_TYPE,
+                members: &lb.members,
+            }
+            .serialize(serializer),
         }
     }
 }
@@ -335,12 +658,48 @@ fn expand_env(value: String) -> Result<String, ConfigError> {
 mod tests {
     use super::*;
 
+    const CONFIG_YAML: &str = r#"
+default: deepseek
+providers:
+  deepseek:
+    type: chat
+    baseurl: https://xxxxxxx
+    apikey: sk-xxxxxxx
+  openai:
+    type: responses
+    baseurl: https://yyyyyyy
+    apikey: sk-yyyyyyy
+  anthropic:
+    type: messages
+    baseurl: https://zzzzzzz
+    apikey: sk-zzzzzzz
+"#;
+
+    const LB_YAML: &str = r#"
+default: pool
+providers:
+  primary:
+    type: chat
+    baseurl: https://primary.test/v1
+    apikey: sk-primary
+  secondary:
+    type: responses
+    baseurl: https://secondary.test/v1
+    apikey: sk-secondary
+  pool:
+    type: lb
+    members: [primary, secondary]
+"#;
+
     #[test]
     fn automatic_codex_preserves_configured_providers_and_default() {
         let config = Config::parse(Path::new("config.yaml"), CONFIG_YAML).unwrap();
         let effective = config.clone().with_codex(true);
         assert_eq!(effective.default, "deepseek");
-        assert_eq!(effective.providers["codex"].provider_type, Provider::Codex);
+        assert_eq!(
+            effective.providers["codex"].protocol(),
+            Some(Protocol::Codex)
+        );
         assert!(!config.providers.contains_key("codex"));
         assert_eq!(config.clone().with_codex(false), config);
         let mut collision = config;
@@ -362,23 +721,6 @@ mod tests {
         assert!(saved.providers.is_empty());
         assert!(saved.with_codex(true).provider(None).is_ok());
     }
-
-    const CONFIG_YAML: &str = r#"
-default: deepseek
-providers:
-  deepseek:
-    type: chat
-    baseurl: https://xxxxxxx
-    apikey: sk-xxxxxxx
-  openai:
-    type: responses
-    baseurl: https://yyyyyyy
-    apikey: sk-yyyyyyy
-  anthropic:
-    type: messages
-    baseurl: https://zzzzzzz
-    apikey: sk-zzzzzzz
-"#;
 
     #[test]
     fn access_log_defaults_off_and_reads_true() {
@@ -416,16 +758,16 @@ providers:
         assert_eq!(config.default, "deepseek");
         assert_eq!(config.providers.len(), 3);
         assert_eq!(
-            config.providers["deepseek"].provider_type,
-            Provider::OpenAiChat
+            config.providers["deepseek"].protocol(),
+            Some(Protocol::OpenAiChat)
         );
         assert_eq!(
-            config.providers["openai"].provider_type,
-            Provider::OpenAiResponses
+            config.providers["openai"].protocol(),
+            Some(Protocol::OpenAiResponses)
         );
         assert_eq!(
-            config.providers["anthropic"].provider_type,
-            Provider::Anthropic
+            config.providers["anthropic"].protocol(),
+            Some(Protocol::Anthropic)
         );
     }
 
@@ -439,21 +781,21 @@ providers:
             config
                 .add_provider(
                     "deepseek".into(),
-                    ProviderConfig {
-                        provider_type: Provider::OpenAiChat,
-                        base_url: "https://api.deepseek.test/".into(),
-                        api_key: Some("sk-test".into()),
-                    },
+                    ProviderConfig::upstream(
+                        Protocol::OpenAiChat,
+                        "https://api.deepseek.test/",
+                        Some("sk-test".into()),
+                    ),
                 )
                 .unwrap();
             config
                 .add_provider(
                     "openai".into(),
-                    ProviderConfig {
-                        provider_type: Provider::OpenAiResponses,
-                        base_url: "https://api.openai.test".into(),
-                        api_key: None,
-                    },
+                    ProviderConfig::upstream(
+                        Protocol::OpenAiResponses,
+                        "https://api.openai.test",
+                        None,
+                    ),
                 )
                 .unwrap();
             config.set_default("openai").unwrap();
@@ -463,10 +805,206 @@ providers:
             assert_eq!(loaded.api_key.as_deref(), Some("${LLMAPI_API_KEY}"));
             assert_eq!(loaded.default, "openai");
             assert_eq!(
-                loaded.providers["deepseek"].base_url,
+                loaded.providers["deepseek"].as_upstream().unwrap().base_url,
                 "https://api.deepseek.test"
             );
         }
+    }
+
+    #[test]
+    fn lb_config_round_trips_in_every_format_and_preserves_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut base = Config::parse(Path::new("llmapi.yaml"), LB_YAML).unwrap();
+        base.add_provider(
+            "third".into(),
+            ProviderConfig::upstream(Protocol::Anthropic, "https://third.test", None),
+        )
+        .unwrap();
+        let members = vec![
+            "secondary".to_string(),
+            "third".to_string(),
+            "primary".to_string(),
+        ];
+        base.providers
+            .insert("pool".into(), ProviderConfig::lb(members.clone()));
+        for extension in ["yaml", "yml", "toml", "json"] {
+            let path = dir.path().join(format!("llmapi.{extension}"));
+            let config = base.clone();
+            config.save(&path).unwrap();
+
+            let loaded = Config::load(&path).unwrap();
+            assert_eq!(
+                loaded.providers["pool"].as_lb().unwrap().members,
+                members,
+                "{extension}"
+            );
+            assert_eq!(
+                loaded.providers["primary"].as_upstream().unwrap().protocol,
+                Protocol::OpenAiChat
+            );
+            assert_eq!(loaded, config, "{extension}");
+        }
+    }
+
+    #[test]
+    fn lb_serialization_does_not_fake_address_or_key() {
+        let config = Config::parse(Path::new("llmapi.yaml"), LB_YAML).unwrap();
+
+        let yaml: serde_yaml::Value =
+            serde_yaml::from_str(&serde_yaml::to_string(&config).unwrap()).unwrap();
+        let pool = &yaml["providers"]["pool"];
+        assert_eq!(pool["type"], "lb");
+        assert_eq!(pool["members"].as_sequence().unwrap().len(), 2);
+        assert!(pool.get("baseurl").is_none());
+        assert!(pool.get("apikey").is_none());
+
+        let toml: toml::Value = toml::from_str(&toml::to_string_pretty(&config).unwrap()).unwrap();
+        let pool = &toml["providers"]["pool"];
+        assert_eq!(pool["type"].as_str(), Some("lb"));
+        assert!(pool.get("baseurl").is_none());
+        assert!(pool.get("apikey").is_none());
+    }
+
+    #[test]
+    fn rejects_invalid_lb_definitions() {
+        let cases = [
+            ("members: []", ConfigErrorKind::Empty),
+            ("members: [primary, primary]", ConfigErrorKind::Duplicate),
+            ("members: [missing]", ConfigErrorKind::Unknown),
+            ("members: [pool]", ConfigErrorKind::SelfReference),
+            ("members: [other]", ConfigErrorKind::Nested),
+        ];
+        for (members, kind) in cases {
+            let mut body = LB_YAML.replace("members: [primary, secondary]", members);
+            if kind == ConfigErrorKind::Nested {
+                body = format!("{body}  other:\n    type: lb\n    members: [primary]\n");
+            }
+            let result = Config::parse(Path::new("llmapi.yaml"), &body);
+            let error = result.unwrap_err();
+            match kind {
+                ConfigErrorKind::Empty => {
+                    assert!(matches!(error, ConfigError::EmptyLbMembers(_)), "{members}")
+                }
+                ConfigErrorKind::Duplicate => {
+                    assert!(matches!(error, ConfigError::DuplicateLbMember { .. }))
+                }
+                ConfigErrorKind::Unknown => {
+                    assert!(matches!(error, ConfigError::LbMemberNotFound { .. }))
+                }
+                ConfigErrorKind::SelfReference => {
+                    assert!(matches!(error, ConfigError::LbSelfReference(_)))
+                }
+                ConfigErrorKind::Nested => {
+                    assert!(matches!(error, ConfigError::NestedLb { .. }))
+                }
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum ConfigErrorKind {
+        Empty,
+        Duplicate,
+        Unknown,
+        SelfReference,
+        Nested,
+    }
+
+    #[test]
+    fn rejects_mixed_lb_and_upstream_fields() {
+        for body in [
+            "default: pool\nproviders:\n  primary:\n    type: chat\n    baseurl: https://a.test\n  pool:\n    type: lb\n    baseurl: https://b.test\n    members: [primary]\n",
+            "default: pool\nproviders:\n  primary:\n    type: chat\n    baseurl: https://a.test\n  pool:\n    type: lb\n    apikey: sk-secret\n    members: [primary]\n",
+            "default: primary\nproviders:\n  primary:\n    type: chat\n    baseurl: https://a.test\n    members: [other]\n",
+        ] {
+            let error = Config::parse(Path::new("llmapi.yaml"), body).unwrap_err();
+            assert!(matches!(error, ConfigError::Yaml(_)), "{error}");
+        }
+    }
+
+    #[test]
+    fn rejects_forbidden_fields_even_when_explicitly_null() {
+        let yaml_lb_baseurl = "default: pool\nproviders:\n  primary:\n    type: chat\n    baseurl: https://a.test\n  pool:\n    type: lb\n    members: [primary]\n    base_url: null\n";
+        let yaml_lb_apikey = "default: pool\nproviders:\n  primary:\n    type: chat\n    baseurl: https://a.test\n  pool:\n    type: lb\n    members: [primary]\n    apikey: null\n";
+        let json_lb_baseurl = r#"{"default":"pool","providers":{"primary":{"type":"chat","baseurl":"https://a.test"},"pool":{"type":"lb","members":["primary"],"baseurl":null}}}"#;
+        let json_lb_apikey = r#"{"default":"pool","providers":{"primary":{"type":"chat","baseurl":"https://a.test"},"pool":{"type":"lb","members":["primary"],"api_key":null}}}"#;
+        let yaml_upstream_members = "default: primary\nproviders:\n  primary:\n    type: chat\n    baseurl: https://a.test\n    members: null\n";
+        let json_upstream_members = r#"{"default":"primary","providers":{"primary":{"type":"chat","baseurl":"https://a.test","members":null}}}"#;
+
+        for (name, body, forbidden) in [
+            ("llmapi.yaml", yaml_lb_baseurl, "baseurl"),
+            ("llmapi.yaml", yaml_lb_apikey, "apikey"),
+            ("llmapi.json", json_lb_baseurl, "baseurl"),
+            ("llmapi.json", json_lb_apikey, "apikey"),
+            ("llmapi.yaml", yaml_upstream_members, "members"),
+            ("llmapi.json", json_upstream_members, "members"),
+        ] {
+            let error = Config::parse(Path::new(name), body).unwrap_err();
+            assert!(
+                error.to_string().contains(forbidden),
+                "{name}: {body} => {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_null_upstream_key_is_still_accepted() {
+        let body = "default: primary\nproviders:\n  primary:\n    type: chat\n    baseurl: https://a.test\n    apikey: null\n";
+        let config = Config::parse(Path::new("llmapi.yaml"), body).unwrap();
+        assert_eq!(
+            config.providers["primary"].as_upstream().unwrap().api_key,
+            None
+        );
+    }
+
+    #[test]
+    fn single_member_lb_and_automatic_codex_member_are_valid() {
+        let body = "default: pool\nproviders:\n  primary:\n    type: chat\n    baseurl: https://a.test\n  pool:\n    type: lb\n    members: [primary]\n  solo:\n    type: lb\n    members: [codex]\n";
+        let config = Config::parse(Path::new("llmapi.yaml"), body).unwrap();
+        assert_eq!(
+            config.providers["pool"].as_lb().unwrap().members,
+            ["primary"]
+        );
+        assert_eq!(config.providers["solo"].as_lb().unwrap().members, ["codex"]);
+        assert!(config.with_codex(true).provider(Some("solo")).is_ok());
+    }
+
+    #[test]
+    fn configured_codex_provider_takes_priority_over_automatic_one() {
+        let body = "default: pool\nproviders:\n  codex:\n    type: chat\n    baseurl: https://codex.test\n  pool:\n    type: lb\n    members: [codex]\n";
+        let config = Config::parse(Path::new("llmapi.yaml"), body).unwrap();
+        let effective = config.with_codex(true);
+        assert_eq!(
+            effective.providers["codex"].protocol(),
+            Some(Protocol::OpenAiChat)
+        );
+        assert_eq!(effective.providers.len(), 2);
+    }
+
+    #[test]
+    fn removing_referenced_provider_fails_without_changes() {
+        let mut config = Config::parse(Path::new("llmapi.yaml"), LB_YAML).unwrap();
+        let before = config.clone();
+        let error = config.remove_provider("primary").unwrap_err();
+        assert!(matches!(
+            &error,
+            ConfigError::ProviderInUse { lb, .. } if lb == "pool"
+        ));
+        assert!(error.to_string().contains("pool"));
+        assert_eq!(config, before);
+
+        config.remove_provider("pool").unwrap();
+        assert!(config.providers.contains_key("primary"));
+        config.remove_provider("primary").unwrap();
+        assert!(!config.providers.contains_key("primary"));
+    }
+
+    #[test]
+    fn default_can_target_lb_and_removal_reselects() {
+        let mut config = Config::parse(Path::new("llmapi.yaml"), LB_YAML).unwrap();
+        assert_eq!(config.default, "pool");
+        config.remove_provider("pool").unwrap();
+        assert_eq!(config.default, "primary");
     }
 
     #[test]
@@ -513,5 +1051,8 @@ providers:
             Provider::OpenAiResponses
         );
         assert_eq!(Provider::from_str("messages").unwrap(), Provider::Anthropic);
+        assert_eq!(Provider::from_str("lb").unwrap(), Provider::Lb);
+        assert_eq!(Provider::Lb.as_str(), "lb");
+        assert_eq!(Provider::Lb.protocol(), None);
     }
 }

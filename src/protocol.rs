@@ -1,4 +1,4 @@
-use super::config::Provider;
+use super::config::Protocol;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputFormat {
@@ -49,13 +49,13 @@ fn detect_endpoint(path: &str) -> Option<InputFormat> {
     }
 }
 
-pub fn upstream_for(provider: Provider) -> (UpstreamFormat, &'static str) {
-    match provider {
-        Provider::OpenAiChat => (UpstreamFormat::OpenAiChat, "/chat/completions"),
-        Provider::OpenAiResponses | Provider::Codex => {
+pub fn upstream_for(protocol: Protocol) -> (UpstreamFormat, &'static str) {
+    match protocol {
+        Protocol::OpenAiChat => (UpstreamFormat::OpenAiChat, "/chat/completions"),
+        Protocol::OpenAiResponses | Protocol::Codex => {
             (UpstreamFormat::OpenAiResponses, "/responses")
         }
-        Provider::Anthropic => (UpstreamFormat::AnthropicMessages, "/messages"),
+        Protocol::Anthropic => (UpstreamFormat::AnthropicMessages, "/messages"),
     }
 }
 
@@ -147,17 +147,17 @@ mod tests {
     }
 
     #[test]
-    fn maps_provider_to_canonical_upstream_endpoint() {
+    fn maps_protocol_to_canonical_upstream_endpoint() {
         assert_eq!(
-            upstream_for(Provider::OpenAiChat),
+            upstream_for(Protocol::OpenAiChat),
             (UpstreamFormat::OpenAiChat, "/chat/completions")
         );
         assert_eq!(
-            upstream_for(Provider::OpenAiResponses),
+            upstream_for(Protocol::OpenAiResponses),
             (UpstreamFormat::OpenAiResponses, "/responses")
         );
         assert_eq!(
-            upstream_for(Provider::Anthropic),
+            upstream_for(Protocol::Anthropic),
             (UpstreamFormat::AnthropicMessages, "/messages")
         );
     }

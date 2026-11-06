@@ -11,6 +11,7 @@ llmapi list
 llmapi check [provider] [--model <model>] [--timeout <seconds>]
 llmapi completion [bash|elvish|fish|powershell|zsh] # 别名: comp
 llmapi add <name> --type <chat|responses|messages> --baseurl <url> [--apikey|--apikey-stdin]
+llmapi add <name> --type lb --members <provider,provider>
 llmapi rm <name>
 llmapi set default <provider>
 llmapi server [--server 127.0.0.1:8080] [--default <provider>]
@@ -18,13 +19,13 @@ llmapi daemon install [--workdir <path>] [--args server ...]
 llmapi daemon start|stop|restart|status|uninstall|remove
 ```
 
-`check` 在不启动服务的情况下探测 provider。使用参数指定的 provider；省略参数时使用配置的默认 provider。不带 `--model` 时请求 `GET /models` 并报告模型数量；带 `--model` 时改为发送一个最小补全请求。命令会输出 provider、状态、延迟和简短响应摘要，并在传输错误或非 2xx 响应时以非零状态退出。`--timeout` 默认 30 秒。Codex 检查使用本地 Codex 登录。
+`check` 在不启动服务的情况下探测 provider。使用参数指定的 provider；省略参数时使用配置的默认 provider。不带 `--model` 时请求 `GET /models` 并报告模型数量；带 `--model` 时改为发送一个最小补全请求。命令会输出 provider、状态、延迟和简短响应摘要，并在传输错误或非 2xx 响应时以非零状态退出。`--timeout` 默认 30 秒，是本次命令的总时间预算。对负载均衡 provider，`check` 从首成员开始按配置顺序探测，输出最终响应的成员和尝试次数，并使用与请求路由相同的失败分类。Codex 检查使用本地 Codex 登录。
 
 `completion` 将 shell 补全脚本写入 stdout。未指定 shell 参数时使用检测到的当前 shell，否则使用 Bash。
 
 `add --apikey` 以不回显的方式提示输入密钥。管道输入使用
 `printf '%s\n' "$API_KEY" | llmapi add <name> --type chat --baseurl <url> --apikey-stdin`。
-`add` 拒绝空密钥和明文密钥参数。省略两个参数时不设置上游密钥。`remove`（别名 `rm`）删除 provider；删除默认 provider 后按名称选择剩余的第一个 provider。最后一个 provider 也可以删除。保存的 provider 密钥以明文保留在配置文件中。
+`add` 拒绝空密钥和明文密钥参数。省略两个参数时不设置上游密钥。`remove`（别名 `rm`）删除 provider；删除默认 provider 后按名称选择剩余的第一个 provider。最后一个 provider 也可以删除，但被 `lb` 组引用的 provider 必须先从组中移除。保存的 provider 密钥以明文保留在配置文件中。
 
 在 macOS 上，`daemon install` 将用户 LaunchAgent 写入
 `~/Library/LaunchAgents/com.virzz.enyo.llmapi.plist`。默认工作目录是当前目录，默认参数是 `server`。`--args` 会替换完整参数列表。日志写入
@@ -54,7 +55,58 @@ llmapi daemon start|stop|restart|status|uninstall|remove
 
 `GET /providers` 返回当前默认 provider 和所有已配置 provider。每个已配置的 `apikey` 返回为 `***`；未设置的密钥会被省略。该端点不会展开环境变量，也不会联系上游 provider。
 
-provider 配置格式见 [examples/config.yaml](examples/config.yaml)。
+## 负载均衡 provider
+
+`type = "lb"` 将已有 provider 组成等权轮询组。每个请求只领取一次起始位置，然后按配置顺序尝试成员，因此 `[A, B, C]` 的请求起点依次为 `A`、`B`、`C`、`A`……；起点为 `B` 时尝试顺序为 `B → C → A`。同一请求中每个成员最多尝试一次，故障切换不会再次推动共享游标。
+
+```toml
+default = "pool"
+
+[providers.primary]
+type = "chat"
+baseurl = "https://primary.example.com/v1"
+apikey = "${PRIMARY_API_KEY}"
+
+[providers.secondary]
+type = "responses"
+baseurl = "https://secondary.example.com/v1"
+apikey = "${SECONDARY_API_KEY}"
+
+[providers.pool]
+type = "lb"
+members = ["primary", "secondary"]
+```
+
+```bash
+llmapi add pool --type lb --members primary,secondary
+llmapi set default pool
+llmapi list
+```
+
+`lb` provider 不接受 `baseurl` 或 `apikey`；`members` 必须是非空、有序且不重复的成员列表。成员必须是现有普通 provider：未知名称、自引用和嵌套 `lb` 都会被拒绝。未配置但自动发现的 `codex` 可以作为成员，运行时凭据不可用则跳过；同名普通 provider 优先。被 `lb` 引用的 provider 在组被修改或删除前不能删除；删除 `lb` 本身不会删除成员。
+
+故障切换只作用于通过 `lb` 发起的请求：
+
+| 结果                                                         | 行为                     |
+| ------------------------------------------------------------ | ------------------------ |
+| DNS、连接、TLS、发送或等待响应头阶段的传输失败               | 尝试下一成员             |
+| 30 秒响应头等待超时                                          | 尝试下一成员             |
+| 上游 `401`、`403`、`408`、`429`、`500..=599`                 | 尝试下一成员             |
+| 成员凭据缺失                                                 | 跳过该成员               |
+| 其他上游状态（如 `400`、`404`、`422`）                       | 返回该响应               |
+| 本服务鉴权、路由、方法或请求转换错误                         | 立即返回错误             |
+| 已选定响应后的解析错误、响应体读取失败或流中断               | 沿用现有响应错误处理     |
+| 重定向（`3xx`）                                              | 返回该响应及 `Location`，不自动跟随 |
+
+每次成员尝试最多等待 30 秒响应头，并复用 15 秒连接超时；已建立的 SSE 流不受该 30 秒限制。经 LB 的请求不会自动跟随重定向，因此单次成员尝试最多对应一次上游请求。CLI `check` 对每个成员应用相同的响应头上限，同时保持 `--timeout` 为整条命令的总预算。N 个成员全部耗尽前最多等待约 N × 30 秒，不包含响应体读取时间。所有成员均因可切换结果失败时，客户端收到符合自身协议错误结构的 `503 Service Unavailable`，其中包含 `lb` 名称和简短失败摘要。不会把某个成员的 `Retry-After` 冒充为整组状态。请求体只读取一次，每次尝试都从原始客户端输入重新转换，因此跨协议切换不会复用上一成员转换后的请求体或密钥。`upstream_raw` 返回选定成员的原始响应。故障切换不保证上游恰好执行一次，`idempotency-key` 不会在不同 provider 之间去重。
+
+`GET /models`（也支持 `/v1` 和 `/{provider}`）与生成请求共享轮询游标，只返回选定成员的目录，不合并多个目录。经 LB 的模型列表不转发 `If-None-Match`，也不暴露成员专属 `ETag`；直连 provider 保持原有条件请求行为。依赖上游会话状态的请求（`previous_response_id`、`conversation`）应使用具体 provider 路由，因为 `lb` 可能在请求之间切换成员。模型名不做映射：同一组应放置支持相同模型和能力的 provider。
+
+每个生效配置版本原子发布自己的配置和游标。有效配置变更会从零开始新游标，在途请求继续使用旧版本；无效热加载保留上一版本。访问具体 provider 的请求不消耗 `lb` 游标，Codex 凭据轮询不会重置游标。
+
+`lb` 组不支持 WebSocket；升级请求会在连接上游前收到 HTTP 400。首版不提供后台健康检查、熔断冷却、嵌套组、权重、会话粘性或跨进程游标协调。
+
+限制与错误行为详见上述表格；provider 配置格式见 [examples/config.yaml](examples/config.yaml)。
 
 ## Codex ChatGPT provider
 

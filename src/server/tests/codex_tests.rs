@@ -1,7 +1,7 @@
 use super::*;
 
 async fn start_codex_proxy(config: Config, auth: watch::Receiver<Option<HeaderMap>>) -> SocketAddr {
-    let (_, config) = watch::channel(Arc::new(config));
+    let (_, config) = watch::channel(Arc::new(Runtime::new(config)));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -27,7 +27,13 @@ fn credentials() -> HeaderMap {
 
 fn codex_config(upstream: String) -> Config {
     let mut config = Config::default().with_codex(true);
-    config.providers.get_mut("codex").unwrap().base_url = upstream;
+    config
+        .providers
+        .get_mut("codex")
+        .unwrap()
+        .as_upstream_mut()
+        .unwrap()
+        .base_url = upstream;
     config
 }
 

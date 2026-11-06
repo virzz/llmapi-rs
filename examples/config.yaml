@@ -15,3 +15,6 @@ providers:
     type: messages
     baseurl: https://api.anthropic.com/v1
     apikey: ${ANTHROPIC_API_KEY}
+  pool:
+    type: lb
+    members: [deepseek, openai]

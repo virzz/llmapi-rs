@@ -1,6 +1,6 @@
 use axum::http::{header, HeaderMap, HeaderValue};
 
-use super::config::Provider;
+use super::config::Protocol;
 
 pub fn extract_api_key(headers: &HeaderMap, query: Option<&str>) -> Option<String> {
     if let Some(value) = headers
@@ -23,7 +23,7 @@ pub fn extract_api_key(headers: &HeaderMap, query: Option<&str>) -> Option<Strin
 
 pub fn apply_api_key(
     headers: &mut HeaderMap,
-    provider: Provider,
+    protocol: Protocol,
     configured: Option<&str>,
     extracted: Option<&str>,
 ) {
@@ -31,14 +31,14 @@ pub fn apply_api_key(
         return;
     };
 
-    match provider {
-        Provider::Codex => {}
-        Provider::OpenAiChat | Provider::OpenAiResponses => {
+    match protocol {
+        Protocol::Codex => {}
+        Protocol::OpenAiChat | Protocol::OpenAiResponses => {
             if let Ok(value) = HeaderValue::from_str(&format!("Bearer {key}")) {
                 headers.insert(header::AUTHORIZATION, value);
             }
         }
-        Provider::Anthropic => {
+        Protocol::Anthropic => {
             if let Ok(value) = HeaderValue::from_str(key) {
                 headers.insert("x-api-key", value);
             }
@@ -46,15 +46,15 @@ pub fn apply_api_key(
     }
 }
 
-pub fn apply_protocol_headers(headers: &mut HeaderMap, provider: Provider, source: &HeaderMap) {
+pub fn apply_protocol_headers(headers: &mut HeaderMap, protocol: Protocol, source: &HeaderMap) {
     for name in ["accept", "idempotency-key", "x-client-request-id"] {
         if let Some(value) = source.get(name) {
             headers.insert(name, value.clone());
         }
     }
 
-    match provider {
-        Provider::Anthropic => {
+    match protocol {
+        Protocol::Anthropic => {
             for name in ["anthropic-version", "anthropic-beta"] {
                 if let Some(value) = source.get(name) {
                     headers.insert(name, value.clone());
@@ -64,11 +64,11 @@ pub fn apply_protocol_headers(headers: &mut HeaderMap, provider: Provider, sourc
                 headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
             }
         }
-        Provider::OpenAiChat | Provider::OpenAiResponses | Provider::Codex => {
+        Protocol::OpenAiChat | Protocol::OpenAiResponses | Protocol::Codex => {
             if let Some(value) = source.get("openai-beta") {
                 headers.insert("openai-beta", value.clone());
             }
-            if provider == Provider::Codex {
+            if protocol == Protocol::Codex {
                 for name in ["session-id", "thread-id"] {
                     if let Some(value) = source.get(name) {
                         headers.insert(name, value.clone());
@@ -120,7 +120,7 @@ mod tests {
 
         apply_api_key(
             &mut headers,
-            Provider::OpenAiChat,
+            Protocol::OpenAiChat,
             Some("sk-config"),
             Some("sk-client"),
         );
@@ -140,8 +140,8 @@ mod tests {
         let source = HeaderMap::new();
         let mut headers = HeaderMap::new();
 
-        apply_api_key(&mut headers, Provider::Anthropic, Some("sk-ant"), None);
-        apply_protocol_headers(&mut headers, Provider::Anthropic, &source);
+        apply_api_key(&mut headers, Protocol::Anthropic, Some("sk-ant"), None);
+        apply_protocol_headers(&mut headers, Protocol::Anthropic, &source);
 
         assert_eq!(headers["x-api-key"], "sk-ant");
         assert_eq!(headers["anthropic-version"], "2023-06-01");
@@ -163,7 +163,7 @@ mod tests {
         source.insert("x-api-key", HeaderValue::from_static("client-secret"));
         let mut headers = HeaderMap::new();
 
-        apply_protocol_headers(&mut headers, Provider::OpenAiResponses, &source);
+        apply_protocol_headers(&mut headers, Protocol::OpenAiResponses, &source);
 
         assert_eq!(headers["accept"], "text/event-stream");
         assert_eq!(headers["idempotency-key"], "retry-1");

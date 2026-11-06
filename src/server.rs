@@ -19,62 +19,101 @@ use serde_json::json;
 use tokio::sync::{oneshot, watch};
 use tracing::{info, warn};
 
-use super::{auth, codex, config::Config, proxy, redact};
+use super::{
+    auth, codex,
+    config::{Config, ProviderConfig},
+    lb, proxy, redact,
+};
 
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<Config>,
     pub client: reqwest::Client,
+    /// Client used for load-balancer attempts: never follows redirects, so one
+    /// member attempt always maps to at most one upstream request.
+    pub lb_client: reqwest::Client,
     pub codex_headers: Option<HeaderMap>,
+    /// Round-robin cursors published together with this config version.
+    pub lb: Arc<lb::State>,
+    /// Upper bound for waiting on one LB member's response headers.
+    pub lb_header_timeout: Duration,
+}
+
+/// One atomically published config version plus its load-balancer cursors.
+pub struct Runtime {
+    pub config: Arc<Config>,
+    pub lb: Arc<lb::State>,
+    lb_header_timeout: Duration,
+}
+
+impl Runtime {
+    fn new(config: Config) -> Self {
+        let lb = Arc::new(lb::State::new(&config));
+        Self {
+            config: Arc::new(config),
+            lb,
+            lb_header_timeout: lb::ATTEMPT_HEADER_TIMEOUT,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_lb_header_timeout(config: Config, lb_header_timeout: Duration) -> Self {
+        let lb = Arc::new(lb::State::new(&config));
+        Self {
+            config: Arc::new(config),
+            lb,
+            lb_header_timeout,
+        }
+    }
 }
 
 #[derive(Clone)]
 struct ServerState {
-    config: watch::Receiver<Arc<Config>>,
+    runtime: watch::Receiver<Arc<Runtime>>,
     client: reqwest::Client,
+    lb_client: reqwest::Client,
     codex_auth: watch::Receiver<Option<HeaderMap>>,
 }
 
 impl ServerState {
     fn snapshot(&self) -> AppState {
         let codex_headers = self.codex_auth.borrow().clone();
-        let config = self.config.borrow().clone();
+        let runtime = self.runtime.borrow().clone();
         let config = if codex_headers.is_some() {
-            Arc::new(config.as_ref().clone().with_codex(true))
+            Arc::new(runtime.config.as_ref().clone().with_codex(true))
         } else {
-            config
+            runtime.config.clone()
         };
         AppState {
             config,
             client: self.client.clone(),
+            lb_client: self.lb_client.clone(),
             codex_headers,
+            lb: runtime.lb.clone(),
+            lb_header_timeout: runtime.lb_header_timeout,
         }
     }
 }
 
 pub fn app(config: Config) -> Router {
-    let (_, config) = watch::channel(Arc::new(config));
-    app_with_config(config)
+    let (_, runtime) = watch::channel(Arc::new(Runtime::new(config)));
+    app_with_config(runtime)
 }
 
-fn app_with_config(config: watch::Receiver<Arc<Config>>) -> Router {
-    app_with_auth(config, codex::watch_auth(codex::auth_path()))
+fn app_with_config(runtime: watch::Receiver<Arc<Runtime>>) -> Router {
+    app_with_auth(runtime, codex::watch_auth(codex::auth_path()))
 }
 
 fn app_with_auth(
-    config: watch::Receiver<Arc<Config>>,
+    runtime: watch::Receiver<Arc<Runtime>>,
     codex_auth: watch::Receiver<Option<HeaderMap>>,
 ) -> Router {
-    let client = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(15))
-        .build()
-        .unwrap_or_else(|err| {
-            warn!(target: "llmapi", error = %err, "failed to configure upstream client");
-            reqwest::Client::new()
-        });
+    let client = build_client(true);
+    let lb_client = build_client(false);
     let state = ServerState {
-        config,
+        runtime,
         client,
+        lb_client,
         codex_auth,
     };
 
@@ -89,12 +128,36 @@ fn app_with_auth(
         .with_state(state)
 }
 
+fn build_client(follow_redirects: bool) -> reqwest::Client {
+    let mut builder = reqwest::Client::builder().connect_timeout(Duration::from_secs(15));
+    if !follow_redirects {
+        // One member attempt must map to exactly one upstream request: no
+        // redirects and no implicit protocol-NACK retries (for example an
+        // HTTP/2 REFUSED_STREAM must surface as a normal LB failure).
+        builder = builder
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never());
+    }
+    builder.build().unwrap_or_else(|err| {
+        warn!(target: "llmapi", error = %err, "failed to configure upstream client");
+        if follow_redirects {
+            reqwest::Client::new()
+        } else {
+            reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .retry(reqwest::retry::never())
+                .build()
+                .unwrap_or_default()
+        }
+    })
+}
+
 async fn require_api_key(
     State(state): State<ServerState>,
     request: Request<Body>,
     next: Next,
 ) -> Response<Body> {
-    let config = state.config.borrow().clone();
+    let config = state.runtime.borrow().config.clone();
     match config.api_key() {
         Ok(None) => next.run(request).await,
         Ok(Some(expected)) => {
@@ -117,7 +180,7 @@ async fn access_log(
     request: Request<Body>,
     next: Next,
 ) -> Response<Body> {
-    let enabled = state.config.borrow().access_log;
+    let enabled = state.runtime.borrow().config.access_log;
     if !enabled {
         return next.run(request).await;
     }
@@ -145,8 +208,12 @@ async fn access_log(
 async fn providers(State(state): State<ServerState>) -> impl IntoResponse {
     let mut config = state.snapshot().config.as_ref().clone();
     for provider in config.providers.values_mut() {
-        if provider.api_key.is_some() {
-            provider.api_key = Some("***".into());
+        if let ProviderConfig::Upstream(upstream) = provider {
+            if upstream.api_key.is_some() {
+                upstream.api_key = Some("***".into());
+            }
+            // Never expose credentials embedded in the configured URL.
+            upstream.base_url = redact::url(&upstream.base_url);
         }
     }
     Json(json!({"default": config.default, "providers": config.providers}))
@@ -173,7 +240,7 @@ pub(crate) async fn serve_reloading(
     let listener = tokio::net::TcpListener::bind(addr).await?;
     info!(target: "llmapi", address = %listener.local_addr()?, "server listening");
     let mut listen_address = config.server.clone();
-    let (sender, mut receiver) = watch::channel(Arc::new(config));
+    let (sender, mut receiver) = watch::channel(Arc::new(Runtime::new(config)));
     let watcher = watch_config(
         path,
         listen_address.clone(),
@@ -204,7 +271,7 @@ pub(crate) async fn serve_reloading(
             }
             _ = retry.tick() => {}
         }
-        let requested_address = receiver.borrow().server.clone();
+        let requested_address = receiver.borrow().config.server.clone();
         if requested_address == listen_address {
             last_bind_error = None;
             continue;
@@ -250,7 +317,7 @@ pub(crate) async fn serve_reloading(
 
 async fn run_server(
     listener: tokio::net::TcpListener,
-    config: watch::Receiver<Arc<Config>>,
+    config: watch::Receiver<Arc<Runtime>>,
     codex_auth: watch::Receiver<Option<HeaderMap>>,
     shutdown: oneshot::Receiver<()>,
 ) -> Result<()> {
@@ -270,7 +337,7 @@ async fn watch_config(
     listen_address: String,
     server_override: bool,
     default_override: Option<String>,
-    sender: watch::Sender<Arc<Config>>,
+    sender: watch::Sender<Arc<Runtime>>,
 ) {
     let mut interval = tokio::time::interval(Duration::from_millis(500));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -309,8 +376,8 @@ async fn watch_config(
         match config {
             Ok(config) => {
                 last_error = None;
-                if **sender.borrow() != config {
-                    sender.send_replace(Arc::new(config));
+                if sender.borrow().config.as_ref() != &config {
+                    sender.send_replace(Arc::new(Runtime::new(config)));
                     info!(target: "llmapi", path = %path.display(), "config reloaded");
                 }
             }
@@ -351,7 +418,8 @@ fn handler(
 #[cfg(test)]
 mod tests {
     mod codex_tests;
-    use std::{collections::BTreeMap, convert::Infallible, fs, sync::Arc};
+    mod lb_tests;
+    use std::{collections::BTreeMap, convert::Infallible, fs, path::Path, sync::Arc};
 
     use axum::{
         body::Bytes,
@@ -366,7 +434,7 @@ mod tests {
     use tokio::sync::Mutex;
 
     use super::*;
-    use crate::config::{Config, Provider, ProviderConfig};
+    use crate::config::{Config, Protocol, ProviderConfig};
 
     #[derive(Debug, Clone)]
     struct CapturedRequest {
@@ -545,39 +613,61 @@ mod tests {
             providers: BTreeMap::from([
                 (
                     "deepseek".into(),
-                    ProviderConfig {
-                        provider_type: Provider::OpenAiChat,
-                        base_url: base_url.into(),
-                        api_key: Some("sk-deepseek".into()),
-                    },
+                    ProviderConfig::upstream(
+                        Protocol::OpenAiChat,
+                        base_url,
+                        Some("sk-deepseek".into()),
+                    ),
                 ),
                 (
                     "openai".into(),
-                    ProviderConfig {
-                        provider_type: Provider::OpenAiResponses,
-                        base_url: base_url.into(),
-                        api_key: Some("sk-openai".into()),
-                    },
+                    ProviderConfig::upstream(
+                        Protocol::OpenAiResponses,
+                        base_url,
+                        Some("sk-openai".into()),
+                    ),
                 ),
                 (
                     "anthropic".into(),
-                    ProviderConfig {
-                        provider_type: Provider::Anthropic,
-                        base_url: base_url.into(),
-                        api_key: Some("sk-anthropic".into()),
-                    },
+                    ProviderConfig::upstream(
+                        Protocol::Anthropic,
+                        base_url,
+                        Some("sk-anthropic".into()),
+                    ),
                 ),
             ]),
         }
+    }
+
+    fn atomic_config_path(path: &Path) -> std::path::PathBuf {
+        let extension = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("yaml");
+        path.with_file_name(format!("config.next.{extension}"))
+    }
+
+    /// Replace the config file atomically so the watcher can never observe a
+    /// partially written body.
+    fn write_config_atomically(path: &Path, body: &str) {
+        let temporary = atomic_config_path(path);
+        fs::write(&temporary, body).unwrap();
+        fs::rename(&temporary, path).unwrap();
+    }
+
+    fn save_config_atomically(config: &Config, path: &Path) {
+        let temporary = atomic_config_path(path);
+        config.save(&temporary).unwrap();
+        fs::rename(&temporary, path).unwrap();
     }
 
     async fn start_proxy(config: Config) -> SocketAddr {
         let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = proxy_listener.local_addr().unwrap();
         tokio::spawn(async move {
-            let (_, config) = watch::channel(Arc::new(config));
+            let (_, runtime) = watch::channel(Arc::new(Runtime::new(config)));
             let (_, auth) = watch::channel(None);
-            axum::serve(proxy_listener, app_with_auth(config, auth))
+            axum::serve(proxy_listener, app_with_auth(runtime, auth))
                 .await
                 .unwrap();
         });
@@ -595,12 +685,18 @@ mod tests {
         }))
         .await;
         let mut config = test_config(&first_upstream);
-        config.providers.get_mut("openai").unwrap().base_url = second_upstream;
+        config
+            .providers
+            .get_mut("openai")
+            .unwrap()
+            .as_upstream_mut()
+            .unwrap()
+            .base_url = second_upstream;
         let directory = tempdir().unwrap();
         let path = directory.path().join("config.yaml");
         config.save(&path).unwrap();
 
-        let (sender, mut receiver) = watch::channel(Arc::new(config.clone()));
+        let (sender, mut receiver) = watch::channel(Arc::new(Runtime::new(config.clone())));
         let watcher = tokio::spawn(watch_config(
             path.clone(),
             config.server.clone(),
@@ -627,17 +723,17 @@ mod tests {
 
         config.default = "openai".into();
         config.server = "127.0.0.1:9090".into();
-        config.save(&path).unwrap();
+        save_config_atomically(&config, &path);
         tokio::time::timeout(Duration::from_secs(3), receiver.changed())
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(receiver.borrow().default, "openai");
-        assert_eq!(receiver.borrow().server, "127.0.0.1:0");
+        assert_eq!(receiver.borrow().config.default, "openai");
+        assert_eq!(receiver.borrow().config.server, "127.0.0.1:0");
         let second: Value = list_models().send().await.unwrap().json().await.unwrap();
         assert_eq!(second["data"][0]["id"], "second");
 
-        fs::write(&path, "default: missing\nproviders: {}\n").unwrap();
+        write_config_atomically(&path, "default: missing\nproviders: {}\n");
         assert!(
             tokio::time::timeout(Duration::from_millis(800), receiver.changed())
                 .await
@@ -656,7 +752,7 @@ mod tests {
         assert_eq!(still_second["data"][0]["id"], "second");
 
         config.default = "deepseek".into();
-        config.save(&path).unwrap();
+        save_config_atomically(&config, &path);
         tokio::time::timeout(Duration::from_secs(3), receiver.changed())
             .await
             .unwrap()
@@ -675,7 +771,7 @@ mod tests {
         let mut active = file_config.clone();
         active.default = "openai".into();
         active.server = "127.0.0.1:8081".into();
-        let (sender, mut receiver) = watch::channel(Arc::new(active));
+        let (sender, mut receiver) = watch::channel(Arc::new(Runtime::new(active)));
         let watcher = tokio::spawn(watch_config(
             path.clone(),
             "127.0.0.1:8081".into(),
@@ -684,28 +780,37 @@ mod tests {
             sender,
         ));
 
-        file_config.providers.get_mut("openai").unwrap().base_url = "https://second.test".into();
+        file_config
+            .providers
+            .get_mut("openai")
+            .unwrap()
+            .as_upstream_mut()
+            .unwrap()
+            .base_url = "https://second.test".into();
         file_config.server = "127.0.0.1:9090".into();
-        file_config.save(&path).unwrap();
+        save_config_atomically(&file_config, &path);
         tokio::time::timeout(Duration::from_secs(3), receiver.changed())
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(receiver.borrow().default, "openai");
-        assert_eq!(receiver.borrow().server, "127.0.0.1:8081");
+        assert_eq!(receiver.borrow().config.default, "openai");
+        assert_eq!(receiver.borrow().config.server, "127.0.0.1:8081");
         assert_eq!(
-            receiver.borrow().providers["openai"].base_url,
+            receiver.borrow().config.providers["openai"]
+                .as_upstream()
+                .unwrap()
+                .base_url,
             "https://second.test"
         );
 
         file_config.providers.remove("openai");
-        file_config.save(&path).unwrap();
+        save_config_atomically(&file_config, &path);
         assert!(
             tokio::time::timeout(Duration::from_millis(800), receiver.changed())
                 .await
                 .is_err()
         );
-        assert!(receiver.borrow().providers.contains_key("openai"));
+        assert!(receiver.borrow().config.providers.contains_key("openai"));
         watcher.abort();
     }
 
@@ -743,7 +848,7 @@ mod tests {
         let second_address = occupied.local_addr().unwrap();
         config.server = second_address.to_string();
         config.default = "openai".into();
-        config.save(&path).unwrap();
+        save_config_atomically(&config, &path);
         tokio::time::sleep(Duration::from_millis(700)).await;
         let still_first: Value = client
             .get(&first_url)
@@ -785,7 +890,7 @@ mod tests {
     #[tokio::test]
     async fn config_watcher_stops_when_server_drops() {
         let config = test_config("https://example.test");
-        let (sender, receiver) = watch::channel(Arc::new(config.clone()));
+        let (sender, receiver) = watch::channel(Arc::new(Runtime::new(config.clone())));
         let watcher = tokio::spawn(watch_config(
             PathBuf::from("missing.yaml"),
             config.server,
@@ -955,8 +1060,20 @@ mod tests {
     #[tokio::test]
     async fn providers_lists_active_config_without_exposing_api_keys() {
         let mut config = test_config("https://example.test");
-        config.providers.get_mut("openai").unwrap().api_key = Some("${OPENAI_API_KEY}".into());
-        config.providers.get_mut("anthropic").unwrap().api_key = None;
+        config
+            .providers
+            .get_mut("openai")
+            .unwrap()
+            .as_upstream_mut()
+            .unwrap()
+            .api_key = Some("${OPENAI_API_KEY}".into());
+        config
+            .providers
+            .get_mut("anthropic")
+            .unwrap()
+            .as_upstream_mut()
+            .unwrap()
+            .api_key = None;
         let proxy = start_proxy(config).await;
 
         let response = reqwest::get(format!("http://{proxy}/providers"))
@@ -990,7 +1107,13 @@ mod tests {
         let (upstream, captured) = start_upstream(json!({"object": "list", "data": []})).await;
         let mut config = test_config(&upstream);
         config.api_key = Some("client-secret".into());
-        config.providers.get_mut("deepseek").unwrap().api_key = None;
+        config
+            .providers
+            .get_mut("deepseek")
+            .unwrap()
+            .as_upstream_mut()
+            .unwrap()
+            .api_key = None;
         let proxy = start_proxy(config).await;
         let client = reqwest::Client::new();
 

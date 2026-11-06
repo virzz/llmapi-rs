@@ -4,7 +4,7 @@ use axum::{
     http::{header, HeaderMap, HeaderValue, Method, Response, StatusCode},
 };
 use bytes::{Bytes, BytesMut};
-use futures_util::{FutureExt, SinkExt, StreamExt};
+use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tracing::{debug, error, info, warn};
@@ -16,7 +16,8 @@ use super::{
         SseDecoder, SseEvent, StreamAdapter, StreamState,
     },
     auth, codex,
-    config::{Provider, ProviderConfig},
+    config::{Protocol, ProviderConfig, UpstreamConfig},
+    lb,
     model::{LLMRequest, LLMResponse},
     models,
     protocol::{detect_route, is_transparent, upstream_for, InputFormat, UpstreamFormat},
@@ -24,19 +25,76 @@ use super::{
     server::AppState,
 };
 
-const MAX_JSON_BODY_BYTES: usize = 64 * 1024 * 1024;
-const MAX_ERROR_BODY_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_JSON_BODY_BYTES: usize = 64 * 1024 * 1024;
+pub(crate) const MAX_ERROR_BODY_BYTES: usize = 1024 * 1024;
 
-struct ForwardRequest<'a> {
-    state: AppState,
-    provider: ProviderConfig,
-    headers: &'a HeaderMap,
-    query: Option<&'a str>,
-    input: &'a InputFormat,
-    upstream: UpstreamFormat,
-    path: &'a str,
+/// How an upstream response becomes a client response.
+enum ResponseMode {
+    Models {
+        codex_client: bool,
+        allow_etag: bool,
+    },
+    /// Transparent same-protocol passthrough.
+    Raw,
+    /// Converted request with the original upstream response returned as-is.
+    RawUpstream,
+    Converted {
+        input: InputFormat,
+        upstream: UpstreamFormat,
+    },
+    Codex {
+        input: InputFormat,
+        stream: bool,
+    },
+}
+
+/// Everything needed to send one attempt to a concrete upstream.
+struct RequestPlan {
+    protocol: Protocol,
+    method: Method,
+    url: String,
+    query: Option<String>,
+    api_key: Option<String>,
+    client_headers: HeaderMap,
+    derived_headers: HeaderMap,
     body: Bytes,
-    upstream_raw: bool,
+    mode: ResponseMode,
+    conditional: bool,
+    /// LB attempts disable redirects so one member attempt equals one request.
+    follow_redirects: bool,
+}
+
+enum SendError {
+    Timeout,
+    Request(reqwest::Error),
+}
+
+enum Attempt {
+    Response(Response<Body>),
+    Switch(String),
+}
+
+enum LbRequest<'a> {
+    Models {
+        query: Option<&'a str>,
+        codex_client: bool,
+    },
+    Generate {
+        method: Method,
+        query: Option<&'a str>,
+        input: InputFormat,
+        body: Bytes,
+        upstream_raw: bool,
+    },
+}
+
+impl LbRequest<'_> {
+    fn input(&self) -> InputFormat {
+        match self {
+            Self::Models { .. } => InputFormat::Models,
+            Self::Generate { input, .. } => *input,
+        }
+    }
 }
 
 pub async fn handle(
@@ -73,15 +131,26 @@ pub async fn handle_with_websocket(
                 "invalid_request_error",
             );
         }
-        let Some((_, provider)) = state.config.provider(route.provider.as_deref()).ok() else {
+        let provider = match state.config.provider(route.provider.as_deref()) {
+            Ok((_, provider)) => provider.clone(),
+            Err(err) => {
+                return protocol_error_response(
+                    &route.input,
+                    StatusCode::NOT_FOUND,
+                    &err.to_string(),
+                    "invalid_request_error",
+                );
+            }
+        };
+        let Some(upstream) = provider.as_upstream() else {
             return protocol_error_response(
                 &route.input,
-                StatusCode::NOT_FOUND,
-                "provider not found",
+                StatusCode::BAD_REQUEST,
+                "load balancer providers do not support WebSocket connections",
                 "invalid_request_error",
             );
         };
-        if provider.provider_type != Provider::OpenAiResponses {
+        if upstream.protocol != Protocol::OpenAiResponses {
             return protocol_error_response(
                 &route.input,
                 StatusCode::BAD_REQUEST,
@@ -89,10 +158,10 @@ pub async fn handle_with_websocket(
                 "invalid_request_error",
             );
         }
-        let provider = provider.clone();
+        let upstream = upstream.clone();
         let query = request.uri().query().map(ToString::to_string);
         return websocket
-            .on_upgrade(move |socket| proxy_websocket(state, headers, provider, query, socket));
+            .on_upgrade(move |socket| proxy_websocket(state, headers, upstream, query, socket));
     }
     let expected_method = if route.input == InputFormat::Models {
         Method::GET
@@ -111,8 +180,8 @@ pub async fn handle_with_websocket(
             "invalid_request_error",
         );
     }
-    let mut provider = match state.config.provider(route.provider.as_deref()) {
-        Ok((_, provider)) => provider.clone(),
+    let (provider_name, provider) = match state.config.provider(route.provider.as_deref()) {
+        Ok((name, provider)) => (name.to_owned(), provider.clone()),
         Err(err) => {
             return protocol_error_response(
                 &route.input,
@@ -122,109 +191,177 @@ pub async fn handle_with_websocket(
             );
         }
     };
-    if provider.provider_type == Provider::Codex && state.codex_headers.is_none() {
-        return protocol_error_response(
-            &route.input,
-            StatusCode::BAD_GATEWAY,
-            "Codex ChatGPT credentials are unavailable",
-            "api_error",
-        );
-    }
-    provider.api_key = match provider.api_key() {
-        Ok(api_key) => api_key,
-        Err(err) => {
+    let input = route.input;
+
+    if input == InputFormat::Models {
+        let codex_client = models::is_codex_client(&headers, query.as_deref());
+        if let Some(lb_config) = provider.as_lb() {
+            let members = state
+                .lb
+                .candidates(&provider_name)
+                .unwrap_or_else(|| lb_config.members.clone());
+            return lb_dispatch(
+                state,
+                &provider_name,
+                &members,
+                &headers,
+                LbRequest::Models {
+                    query: query.as_deref(),
+                    codex_client,
+                },
+            )
+            .await;
+        }
+        let upstream = provider
+            .as_upstream()
+            .expect("non-lb provider resolves to an upstream");
+        if upstream.protocol == Protocol::Codex && state.codex_headers.is_none() {
             return protocol_error_response(
-                &route.input,
+                &input,
                 StatusCode::BAD_GATEWAY,
-                &err.to_string(),
+                "Codex ChatGPT credentials are unavailable",
                 "api_error",
             );
         }
-    };
-    if route.input == InputFormat::Models {
-        let codex_client = models::is_codex_client(&headers, query.as_deref());
-        let mut url = upstream_url(&provider.base_url, "/models", query.as_deref());
-        if provider.provider_type == Provider::Codex
-            && !query.as_deref().is_some_and(|query| {
-                url::form_urlencoded::parse(query.as_bytes())
-                    .any(|(key, _)| key == "client_version")
-            })
-        {
-            url.push(if url.contains('?') { '&' } else { '?' });
-            url.push_str("client_version=");
-            url.push_str(codex::CLIENT_VERSION);
-        }
-        return match send_upstream_request(
-            state,
-            provider,
+        let api_key = match upstream.api_key() {
+            Ok(api_key) => api_key,
+            Err(err) => {
+                return protocol_error_response(
+                    &input,
+                    StatusCode::BAD_GATEWAY,
+                    &err.to_string(),
+                    "api_error",
+                );
+            }
+        };
+        let plan = plan_models(
+            upstream,
+            api_key,
             &headers,
-            Method::GET,
             query.as_deref(),
-            &url,
-            Bytes::new(),
-        )
-        .await
-        {
-            Ok(upstream) => models_response(upstream, codex_client).await,
-            Err(err) => protocol_error_response(
-                &route.input,
-                StatusCode::BAD_GATEWAY,
-                &err.to_string(),
-                "api_error",
-            ),
+            codex_client,
+            true,
+            true,
+        );
+        return match send_plan(&state, &plan, None).await {
+            Ok(upstream_response) => build_response(plan.mode, upstream_response).await,
+            Err(err) => send_error_response(&input, err, None),
         };
     }
+
     let body = match to_bytes(request.into_body(), MAX_JSON_BODY_BYTES).await {
         Ok(body) => body,
         Err(err) => {
             return protocol_error_response(
-                &route.input,
+                &input,
                 StatusCode::BAD_REQUEST,
                 &err.to_string(),
                 "invalid_request_error",
             );
         }
     };
-    let input = route.input;
-    let (upstream, path) = upstream_for(provider.provider_type);
 
-    if provider.provider_type != Provider::Codex && is_transparent(input, upstream) {
-        debug!(target: "llmapi", path, "transparent proxy");
-        return forward_raw(
+    if let Some(lb_config) = provider.as_lb() {
+        let members = state
+            .lb
+            .candidates(&provider_name)
+            .unwrap_or_else(|| lb_config.members.clone());
+        return lb_dispatch(
             state,
-            provider,
+            &provider_name,
+            &members,
             &headers,
-            method,
-            query.as_deref(),
-            path,
-            body,
+            LbRequest::Generate {
+                method,
+                query: query.as_deref(),
+                input,
+                body,
+                upstream_raw,
+            },
         )
         .await;
     }
 
-    debug!(target: "llmapi", ?input, ?upstream, "protocol adapter selected");
-    convert_and_forward(ForwardRequest {
-        state,
-        provider,
-        headers: &headers,
-        query: query.as_deref(),
-        input: &input,
+    let upstream = provider
+        .as_upstream()
+        .expect("non-lb provider resolves to an upstream");
+    if upstream.protocol == Protocol::Codex && state.codex_headers.is_none() {
+        return protocol_error_response(
+            &input,
+            StatusCode::BAD_GATEWAY,
+            "Codex ChatGPT credentials are unavailable",
+            "api_error",
+        );
+    }
+    let api_key = match upstream.api_key() {
+        Ok(api_key) => api_key,
+        Err(err) => {
+            return protocol_error_response(
+                &input,
+                StatusCode::BAD_GATEWAY,
+                &err.to_string(),
+                "api_error",
+            );
+        }
+    };
+    let plan = match plan_generate(
         upstream,
-        path,
-        body,
-        upstream_raw,
-    })
-    .await
+        api_key,
+        GenerateRequest {
+            input,
+            client_headers: &headers,
+            method,
+            query: query.as_deref(),
+            body: &body,
+            upstream_raw,
+            follow_redirects: true,
+        },
+    ) {
+        Ok(plan) => plan,
+        Err(response) => return *response,
+    };
+    let upstream_response = match send_plan(&state, &plan, None).await {
+        Ok(upstream_response) => upstream_response,
+        Err(err) => return send_error_response(&input, err, None),
+    };
+    info!(
+        target: "llmapi",
+        method = %plan.method,
+        url = %redact::url(upstream_response.url().as_str()),
+        status = %upstream_response.status(),
+        "upstream response received"
+    );
+    build_response(plan.mode, upstream_response).await
+}
+
+fn send_error_response(
+    input: &InputFormat,
+    err: SendError,
+    member: Option<&str>,
+) -> Response<Body> {
+    let message = match err {
+        SendError::Timeout => "upstream response header timeout".to_string(),
+        SendError::Request(err) => redact::transport_error(err),
+    };
+    match member {
+        Some(member) => {
+            error!(target: "llmapi", member = %member, error = %message, "upstream request failed");
+        }
+        None => {
+            error!(target: "llmapi", error = %message, "upstream request failed");
+        }
+    }
+    protocol_error_response(input, StatusCode::BAD_GATEWAY, &message, "api_error")
 }
 
 async fn proxy_websocket(
     state: AppState,
     headers: HeaderMap,
-    provider: ProviderConfig,
+    upstream: UpstreamConfig,
     query: Option<String>,
     mut client: WebSocket,
 ) {
-    let provider_key = match provider.api_key() {
+    let provider_key = match upstream.api_key() {
         Ok(key) => key,
         Err(err) => {
             let _ = client
@@ -242,12 +379,12 @@ async fn proxy_websocket(
     let mut upstream_headers = HeaderMap::new();
     auth::apply_api_key(
         &mut upstream_headers,
-        provider.provider_type,
+        upstream.protocol,
         provider_key.as_deref(),
         extracted.as_deref(),
     );
-    auth::apply_protocol_headers(&mut upstream_headers, provider.provider_type, &headers);
-    let url = websocket_url(&provider.base_url, "/responses", query.as_deref());
+    auth::apply_protocol_headers(&mut upstream_headers, upstream.protocol, &headers);
+    let url = websocket_url(&upstream.base_url, "/responses", query.as_deref());
     let mut upstream_request = match url.into_client_request() {
         Ok(request) => request,
         Err(err) => {
@@ -256,7 +393,10 @@ async fn proxy_websocket(
             return;
         }
     };
-    *upstream_request.headers_mut() = upstream_headers;
+    // Keep the generated WebSocket handshake headers and layer auth on top.
+    for (name, value) in &upstream_headers {
+        upstream_request.headers_mut().insert(name, value.clone());
+    }
     let (upstream, _) = match tokio_tungstenite::connect_async(upstream_request).await {
         Ok(connection) => connection,
         Err(err) => {
@@ -318,7 +458,20 @@ fn tungstenite_to_axum(message: tokio_tungstenite::tungstenite::Message) -> Opti
     }
 }
 
-async fn models_response(upstream: reqwest::Response, codex_client: bool) -> Response<Body> {
+async fn models_response(
+    upstream: reqwest::Response,
+    codex_client: bool,
+    allow_etag: bool,
+) -> Response<Body> {
+    let mut response = models_response_inner(upstream, codex_client).await;
+    if !allow_etag {
+        // Never hand out a member-specific validator through the load balancer.
+        response.headers_mut().remove(header::ETAG);
+    }
+    response
+}
+
+async fn models_response_inner(upstream: reqwest::Response, codex_client: bool) -> Response<Body> {
     if !upstream.status().is_success() {
         let mut response = raw_upstream_response(upstream);
         response
@@ -391,122 +544,119 @@ async fn models_response(upstream: reqwest::Response, codex_client: bool) -> Res
     response
 }
 
-pub fn forward_raw(
-    state: AppState,
-    provider: ProviderConfig,
-    headers: &HeaderMap,
-    method: Method,
+fn plan_models(
+    upstream: &UpstreamConfig,
+    api_key: Option<String>,
+    client_headers: &HeaderMap,
     query: Option<&str>,
-    path: &str,
-    body: Bytes,
-) -> impl std::future::Future<Output = Response<Body>> + Send {
-    let url = upstream_url(&provider.base_url, path, query);
-    let upstream_method = method.as_str().to_string();
-    let input = match provider.provider_type {
-        Provider::OpenAiChat => InputFormat::OpenAiChat,
-        Provider::OpenAiResponses | Provider::Codex => InputFormat::OpenAiResponses,
-        Provider::Anthropic => InputFormat::AnthropicMessages,
-    };
-    send_upstream_request(state, provider, headers, method, query, &url, body).map(move |result| {
-        match result {
-            Ok(upstream) => {
-                info!(
-                    target: "llmapi",
-                    method = %upstream_method,
-                    url = %redact::url(upstream.url().as_str()),
-                    status = %upstream.status(),
-                    "upstream response received"
-                );
-                raw_upstream_response(upstream)
-            }
-            Err(err) => {
-                error!(target: "llmapi", error = %err, "upstream request failed");
-                protocol_error_response(
-                    &input,
-                    StatusCode::BAD_GATEWAY,
-                    &err.to_string(),
-                    "api_error",
-                )
-            }
-        }
+    codex_client: bool,
+    allow_etag: bool,
+    follow_redirects: bool,
+) -> RequestPlan {
+    let mut url = upstream_url(&upstream.base_url, "/models", query);
+    if upstream.protocol == Protocol::Codex && !has_client_version(query) {
+        url.push(if url.contains('?') { '&' } else { '?' });
+        url.push_str("client_version=");
+        url.push_str(codex::CLIENT_VERSION);
+    }
+    RequestPlan {
+        protocol: upstream.protocol,
+        method: Method::GET,
+        url,
+        query: query.map(ToString::to_string),
+        api_key,
+        client_headers: client_headers.clone(),
+        derived_headers: HeaderMap::new(),
+        body: Bytes::new(),
+        mode: ResponseMode::Models {
+            codex_client,
+            allow_etag,
+        },
+        // A load-balancer catalog must not depend on a single member's validator.
+        conditional: allow_etag,
+        follow_redirects,
+    }
+}
+
+fn has_client_version(query: Option<&str>) -> bool {
+    query.is_some_and(|query| {
+        url::form_urlencoded::parse(query.as_bytes()).any(|(key, _)| key == "client_version")
     })
 }
 
-fn send_upstream_request(
-    state: AppState,
-    provider: ProviderConfig,
-    headers: &HeaderMap,
+struct GenerateRequest<'a> {
+    input: InputFormat,
+    client_headers: &'a HeaderMap,
     method: Method,
-    auth_query: Option<&str>,
-    url: &str,
-    body: Bytes,
-) -> impl std::future::Future<Output = Result<reqwest::Response, reqwest::Error>> + Send {
-    let extracted = if state.config.api_key.is_none() {
-        auth::extract_api_key(headers, auth_query)
-    } else {
-        None
+    query: Option<&'a str>,
+    body: &'a Bytes,
+    upstream_raw: bool,
+    follow_redirects: bool,
+}
+
+/// A request/conversion error that is returned to the client without failover.
+type PlanFailure = Box<Response<Body>>;
+
+fn plan_generate(
+    upstream: &UpstreamConfig,
+    api_key: Option<String>,
+    request: GenerateRequest<'_>,
+) -> Result<RequestPlan, PlanFailure> {
+    let GenerateRequest {
+        input,
+        client_headers,
+        method,
+        query,
+        body,
+        upstream_raw,
+        follow_redirects,
+    } = request;
+    let (upstream_format, path) = upstream_for(upstream.protocol);
+    let url = upstream_url(&upstream.base_url, path, query);
+    let make = |body: Bytes, derived_headers: HeaderMap, mode: ResponseMode| RequestPlan {
+        protocol: upstream.protocol,
+        method: method.clone(),
+        url: url.clone(),
+        query: query.map(ToString::to_string),
+        api_key: api_key.clone(),
+        client_headers: client_headers.clone(),
+        derived_headers,
+        body,
+        mode,
+        conditional: false,
+        follow_redirects,
     };
-    let mut upstream_headers = HeaderMap::new();
-    auth::apply_api_key(
-        &mut upstream_headers,
-        provider.provider_type,
-        provider.api_key.as_deref(),
-        extracted.as_deref(),
-    );
-    auth::apply_protocol_headers(&mut upstream_headers, provider.provider_type, headers);
-    if provider.provider_type == Provider::Codex {
-        if let Some(auth) = &state.codex_headers {
-            codex::apply_headers(&mut upstream_headers, auth, method == Method::POST);
-        }
+    if upstream.protocol != Protocol::Codex && is_transparent(input, upstream_format) {
+        debug!(target: "llmapi", path, "transparent proxy");
+        return Ok(make(body.clone(), HeaderMap::new(), ResponseMode::Raw));
     }
-    if method == Method::GET {
-        if let Some(etag) = headers.get(header::IF_NONE_MATCH) {
-            upstream_headers.insert(header::IF_NONE_MATCH, etag.clone());
-        }
-    }
-    state
-        .client
-        .request(method, url)
-        .headers(upstream_headers)
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(body)
-        .send()
-}
 
-pub fn response(status: StatusCode, body: Bytes, content_type: &str) -> Response<Body> {
-    Response::builder()
-        .status(status)
-        .header(header::CONTENT_TYPE, content_type)
-        .body(Body::from(body))
-        .unwrap()
-}
-
-async fn convert_and_forward(forward: ForwardRequest<'_>) -> Response<Body> {
-    let input_json: Value = match serde_json::from_slice(&forward.body) {
+    debug!(target: "llmapi", ?input, ?upstream_format, "protocol adapter selected");
+    let input_json: Value = match serde_json::from_slice(body) {
         Ok(value) => value,
         Err(err) => {
-            return protocol_error_response(
-                forward.input,
+            return Err(Box::new(protocol_error_response(
+                &input,
                 StatusCode::BAD_REQUEST,
                 &err.to_string(),
                 "invalid_request_error",
-            );
+            )));
         }
     };
-    let is_codex = forward.provider.provider_type == Provider::Codex;
+    let is_codex = upstream.protocol == Protocol::Codex;
     let client_stream = input_json["stream"].as_bool().unwrap_or(false);
-    let mut upstream_json = if is_codex && *forward.input == InputFormat::OpenAiResponses {
+    let mut upstream_json = if is_codex && input == InputFormat::OpenAiResponses {
         input_json
     } else {
-        let llm_request = match input_to_llm(forward.input, input_json) {
+        let llm_request = match input_to_llm(&input, input_json) {
             Ok(request) => request,
             Err(err) => {
-                return protocol_error_response(
-                    forward.input,
+                return Err(Box::new(protocol_error_response(
+                    &input,
                     StatusCode::BAD_REQUEST,
                     &err.to_string(),
                     "invalid_request_error",
-                );
+                )));
             }
         };
         debug!(
@@ -518,7 +668,7 @@ async fn convert_and_forward(forward: ForwardRequest<'_>) -> Response<Body> {
             tools = llm_request.tools.len(),
             "normalized LLM request"
         );
-        match llm_to_upstream(forward.upstream, &llm_request) {
+        match llm_to_upstream(upstream_format, &llm_request) {
             Ok(value) => value,
             Err(err) => {
                 let (status, error_type) = if matches!(&err, AdapterError::Unsupported(_)) {
@@ -526,76 +676,253 @@ async fn convert_and_forward(forward: ForwardRequest<'_>) -> Response<Body> {
                 } else {
                     (StatusCode::BAD_GATEWAY, "api_error")
                 };
-                return protocol_error_response(
-                    forward.input,
+                return Err(Box::new(protocol_error_response(
+                    &input,
                     status,
                     &err.to_string(),
                     error_type,
-                );
+                )));
             }
         }
     };
     if is_codex {
         if let Err(err) = codex::prepare_request(&mut upstream_json) {
-            return protocol_error_response(
-                forward.input,
+            return Err(Box::new(protocol_error_response(
+                &input,
                 StatusCode::BAD_REQUEST,
                 &err.to_string(),
                 "invalid_request_error",
-            );
+            )));
         }
     }
 
-    let mut headers = forward.headers.clone();
+    let mut derived_headers = HeaderMap::new();
     if is_codex {
         // Derive session headers before serialization; image/tool inputs can be large.
         if let Some(key) = upstream_json["prompt_cache_key"]
             .as_str()
             .and_then(|key| HeaderValue::from_str(key).ok())
         {
-            headers.insert("session-id", key.clone());
-            headers.insert("thread-id", key);
+            derived_headers.insert("session-id", key.clone());
+            derived_headers.insert("thread-id", key);
         }
     }
-    let url = upstream_url(&forward.provider.base_url, forward.path, forward.query);
-    let upstream_response = match send_upstream_request(
-        forward.state.clone(),
-        forward.provider,
-        &headers,
-        Method::POST,
-        forward.query,
-        &url,
-        Bytes::from(serde_json::to_vec(&upstream_json).unwrap()),
-    )
-    .await
-    {
-        Ok(response) => response,
-        Err(err) => {
-            error!(target: "llmapi", error = %err, "upstream request failed");
-            return protocol_error_response(
-                forward.input,
-                StatusCode::BAD_GATEWAY,
-                &err.to_string(),
-                "api_error",
-            );
+    let mode = if upstream_raw {
+        ResponseMode::RawUpstream
+    } else if is_codex {
+        ResponseMode::Codex {
+            input,
+            stream: client_stream,
+        }
+    } else {
+        ResponseMode::Converted {
+            input,
+            upstream: upstream_format,
         }
     };
-    info!(
-        target: "llmapi",
-        method = "POST",
-        url = %redact::url(upstream_response.url().as_str()),
-        status = %upstream_response.status(),
-        "upstream response received"
-    );
-    if forward.upstream_raw {
-        return raw_upstream_response(upstream_response);
-    }
-    if is_codex {
-        return codex_response(upstream_response, forward.input, client_stream).await;
-    }
-    convert_response_back(upstream_response, forward.input, forward.upstream).await
+    Ok(make(
+        Bytes::from(serde_json::to_vec(&upstream_json).unwrap()),
+        derived_headers,
+        mode,
+    ))
 }
 
+async fn send_plan(
+    state: &AppState,
+    plan: &RequestPlan,
+    timeout: Option<std::time::Duration>,
+) -> Result<reqwest::Response, SendError> {
+    let extracted = if state.config.api_key.is_none() {
+        auth::extract_api_key(&plan.client_headers, plan.query.as_deref())
+    } else {
+        None
+    };
+    let mut headers = HeaderMap::new();
+    auth::apply_api_key(
+        &mut headers,
+        plan.protocol,
+        plan.api_key.as_deref(),
+        extracted.as_deref(),
+    );
+    auth::apply_protocol_headers(&mut headers, plan.protocol, &plan.client_headers);
+    for (name, value) in &plan.derived_headers {
+        headers.insert(name.clone(), value.clone());
+    }
+    if plan.protocol == Protocol::Codex {
+        if let Some(auth) = &state.codex_headers {
+            codex::apply_headers(&mut headers, auth, plan.method == Method::POST);
+        }
+    }
+    if plan.conditional {
+        if let Some(etag) = plan.client_headers.get(header::IF_NONE_MATCH) {
+            headers.insert(header::IF_NONE_MATCH, etag.clone());
+        }
+    }
+    let client = if plan.follow_redirects {
+        &state.client
+    } else {
+        &state.lb_client
+    };
+    let request = client
+        .request(plan.method.clone(), &plan.url)
+        .headers(headers)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(plan.body.clone());
+    match timeout {
+        Some(limit) => match tokio::time::timeout(limit, request.send()).await {
+            Ok(result) => result.map_err(SendError::Request),
+            Err(_) => Err(SendError::Timeout),
+        },
+        None => request.send().await.map_err(SendError::Request),
+    }
+}
+
+async fn build_response(mode: ResponseMode, upstream: reqwest::Response) -> Response<Body> {
+    match mode {
+        ResponseMode::Models {
+            codex_client,
+            allow_etag,
+        } => models_response(upstream, codex_client, allow_etag).await,
+        ResponseMode::Raw | ResponseMode::RawUpstream => raw_upstream_response(upstream),
+        ResponseMode::Converted {
+            input,
+            upstream: format,
+        } => convert_response_back(upstream, &input, format).await,
+        ResponseMode::Codex { input, stream } => codex_response(upstream, &input, stream).await,
+    }
+}
+
+async fn lb_dispatch(
+    state: AppState,
+    name: &str,
+    members: &[String],
+    client_headers: &HeaderMap,
+    request: LbRequest<'_>,
+) -> Response<Body> {
+    let input = request.input();
+    let mut failures = Vec::new();
+    for (index, member) in members.iter().enumerate() {
+        match attempt_member(&state, member, client_headers, &request).await {
+            Attempt::Response(response) => return response,
+            Attempt::Switch(reason) => {
+                warn!(
+                    target: "llmapi",
+                    lb = %name,
+                    member = %member,
+                    attempt = index + 1,
+                    reason = %reason,
+                    "load balancer member unavailable; trying next member"
+                );
+                failures.push(format!("{member}: {reason}"));
+            }
+        }
+    }
+    let summary = if failures.is_empty() {
+        "no members attempted".to_string()
+    } else {
+        failures.join("; ")
+    };
+    protocol_error_response(
+        &input,
+        StatusCode::SERVICE_UNAVAILABLE,
+        &format!(
+            "load balancer `{name}` has no available member after {} attempt(s): {summary}",
+            members.len()
+        ),
+        "api_error",
+    )
+}
+
+async fn attempt_member(
+    state: &AppState,
+    member: &str,
+    client_headers: &HeaderMap,
+    request: &LbRequest<'_>,
+) -> Attempt {
+    let Some(upstream) = state
+        .config
+        .providers
+        .get(member)
+        .and_then(ProviderConfig::as_upstream)
+    else {
+        return Attempt::Switch("provider is not configured".into());
+    };
+    if upstream.protocol == Protocol::Codex && state.codex_headers.is_none() {
+        return Attempt::Switch("Codex credentials are unavailable".into());
+    }
+    let api_key = match upstream.api_key() {
+        Ok(api_key) => api_key,
+        Err(err) => return Attempt::Switch(format!("credentials unavailable: {err}")),
+    };
+    let plan = match request {
+        LbRequest::Models {
+            query,
+            codex_client,
+        } => plan_models(
+            upstream,
+            api_key,
+            client_headers,
+            *query,
+            *codex_client,
+            false,
+            false,
+        ),
+        LbRequest::Generate {
+            method,
+            query,
+            input,
+            body,
+            upstream_raw,
+        } => match plan_generate(
+            upstream,
+            api_key,
+            GenerateRequest {
+                input: *input,
+                client_headers,
+                method: method.clone(),
+                query: *query,
+                body,
+                upstream_raw: *upstream_raw,
+                follow_redirects: false,
+            },
+        ) {
+            Ok(plan) => plan,
+            // Recognized request/conversion errors are final: never replayed.
+            Err(response) => return Attempt::Response(*response),
+        },
+    };
+    let timeout = state.lb_header_timeout;
+    let upstream_response = match send_plan(state, &plan, Some(timeout)).await {
+        Ok(response) => response,
+        Err(SendError::Timeout) => {
+            return Attempt::Switch(format!(
+                "response header timeout after {}ms",
+                timeout.as_millis()
+            ))
+        }
+        Err(SendError::Request(err)) => return Attempt::Switch(redact::transport_error(err)),
+    };
+    if lb::is_retryable_status(upstream_response.status()) {
+        return Attempt::Switch(format!("upstream status {}", upstream_response.status()));
+    }
+    info!(
+        target: "llmapi",
+        member = %member,
+        method = %plan.method,
+        url = %redact::url(upstream_response.url().as_str()),
+        status = %upstream_response.status(),
+        "load balancer member responded"
+    );
+    Attempt::Response(build_response(plan.mode, upstream_response).await)
+}
+
+pub fn response(status: StatusCode, body: Bytes, content_type: &str) -> Response<Body> {
+    Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, content_type)
+        .body(Body::from(body))
+        .unwrap()
+}
 async fn codex_response(
     upstream: reqwest::Response,
     input: &InputFormat,
@@ -639,7 +966,7 @@ async fn collect_codex_response(upstream: reqwest::Response) -> Result<Value, St
     let mut decoder = SseDecoder::default();
     let mut size = 0;
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|err| err.to_string())?;
+        let chunk = chunk.map_err(redact::transport_error)?;
         size += chunk.len();
         if size > MAX_JSON_BODY_BYTES {
             return Err("Codex response exceeds the buffered response limit".into());
@@ -871,7 +1198,10 @@ async fn converted_error_response(
     response
 }
 
-async fn read_upstream_body(upstream: reqwest::Response, limit: usize) -> Result<Bytes, String> {
+pub(crate) async fn read_upstream_body(
+    upstream: reqwest::Response,
+    limit: usize,
+) -> Result<Bytes, String> {
     if upstream
         .content_length()
         .is_some_and(|length| length > limit as u64)
@@ -881,7 +1211,12 @@ async fn read_upstream_body(upstream: reqwest::Response, limit: usize) -> Result
     let mut stream = upstream.bytes_stream();
     let mut body = BytesMut::new();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|err| format!("read upstream response body: {err}"))?;
+        let chunk = chunk.map_err(|err| {
+            format!(
+                "read upstream response body: {}",
+                redact::transport_error(err)
+            )
+        })?;
         if body.len().saturating_add(chunk.len()) > limit {
             return Err(format!("upstream response body exceeds {limit} bytes"));
         }
@@ -920,6 +1255,7 @@ fn copy_response_headers(source: &HeaderMap, target: &mut HeaderMap) {
             || name == header::ETAG
             || name == header::VARY
             || name == header::RETRY_AFTER
+            || name == header::LOCATION
             || matches!(
                 name_text,
                 "x-request-id" | "request-id" | "anthropic-request-id" | "openai-processing-ms"
@@ -937,6 +1273,7 @@ fn copy_response_metadata_headers(source: &HeaderMap, target: &mut HeaderMap) {
         if name == header::CACHE_CONTROL
             || name == header::VARY
             || name == header::RETRY_AFTER
+            || name == header::LOCATION
             || matches!(
                 name_text,
                 "x-request-id" | "request-id" | "anthropic-request-id" | "openai-processing-ms"
@@ -1006,7 +1343,8 @@ fn converted_sse_response(
             let chunk = match chunk {
                 Ok(chunk) => chunk,
                 Err(err) => {
-                    for output in stream_error_events(&input, &mut target_state, err.to_string()) {
+                    let message = redact::transport_error(err);
+                    for output in stream_error_events(&input, &mut target_state, message) {
                         yield Ok::<Bytes, std::io::Error>(Bytes::from(output.encode()));
                     }
                     return;
