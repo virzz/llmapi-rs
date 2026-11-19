@@ -1,17 +1,51 @@
 # LLMApi
 
-English | [简体中文](README.md)
+English | [简体中文](README.md) | [Changelog](CHANGELOG.md)
 
 `llmapi` is a standalone Rust CLI and HTTP proxy that converts between OpenAI Chat
-Completions, OpenAI Responses, and Anthropic Messages APIs.
+Completions, OpenAI Responses, and Anthropic Messages APIs. It also supports
+provider round-robin and failover, model allowlists, and relaying requests to
+another llmapi server.
+
+## Quick start
+
+Run `cargo install --path . --locked` from the repository directory, then
+create `llmapi.toml`.
+
+```toml
+server = "127.0.0.1:8080"
+apikey = "${LLMAPI_API_KEY}"
+default = "openai"
+
+[providers.openai]
+type = "responses"
+baseurl = "https://api.openai.com/v1"
+apikey = "${OPENAI_API_KEY}"
+```
+
+Set `OPENAI_API_KEY` to your upstream API key and `LLMAPI_API_KEY` to the key
+clients use to access this server. Start the server, then check the active
+configuration from a second terminal.
+
+```bash
+llmapi --config llmapi.toml server
+```
+
+```bash
+curl -H "Authorization: Bearer $LLMAPI_API_KEY" http://127.0.0.1:8080/providers
+```
+
+Use `http://127.0.0.1:8080/v1` as the client base URL for the default provider,
+or `http://127.0.0.1:8080/openai/v1` to select `openai` explicitly. See the
+[TOML example](examples/config.toml) and [YAML example](examples/config.yaml).
 
 ## Commands
 
 ```bash
-llmapi list
+llmapi list # aliases: ls, l
 llmapi check [provider] [--model <model>] [--timeout <seconds>]
 llmapi completion [bash|elvish|fish|powershell|zsh] # alias: comp
-llmapi add <name> --type <chat|responses|messages|llmapi> --baseurl <url> [--apikey|--apikey-stdin]
+llmapi add <name> --type <chat|responses|messages|llmapi> --baseurl <url> [--apikey|--apikey-stdin] # alias: a
 llmapi add <name> --type lb --members <provider,provider>
 llmapi rm <name>
 llmapi set default <provider>
@@ -84,6 +118,9 @@ the last valid config; changing the selected config path requires a restart.
 | OpenAI Chat        | `/chat/completions` | `/{provider}/chat/completions` |
 | OpenAI Responses   | `/responses`        | `/{provider}/responses`        |
 | Anthropic Messages | `/messages`         | `/{provider}/messages`         |
+
+All generation routes also accept `/v1`, as in `/v1/responses` and
+`/{provider}/v1/responses`.
 
 `/responses` also accepts a WebSocket upgrade when the selected provider uses
 `openai-responses` or `llmapi`.
@@ -236,7 +273,8 @@ An explicitly selected missing config file still returns an error.
 The proxy uses the local access token and account ID for
 `https://chatgpt.com/backend-api/codex`. It **never refreshes tokens or writes
 auth.json**. Keep the login managed by Codex; updates can take up to five
-minutes to reach llmapi. An upstream 401 is returned without retrying. Credentials
+minutes to reach llmapi. Direct requests to the Codex provider return an
+upstream 401 as-is. Credentials
 are not written to llmapi config or exposed by the provider listing. Only the
 file at `~/.codex/auth.json` is used; Keychain-only logins are not discovered.
 

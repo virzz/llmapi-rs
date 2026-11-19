@@ -1,16 +1,43 @@
 # LLMApi
 
-[English](README.en.md) | 简体中文
+[English](README.en.md) | 简体中文 | [变更日志](CHANGELOG.md)
 
-`llmapi` 是一个独立的 Rust CLI 和 HTTP 代理，用于在 OpenAI Chat Completions、OpenAI Responses 和 Anthropic Messages API 之间转换协议。
+`llmapi` 是一个独立的 Rust CLI 和 HTTP 代理，用于在 OpenAI Chat Completions、OpenAI Responses 和 Anthropic Messages API 之间转换协议。它也支持 provider 轮询与故障切换、按模型限制请求，以及中继到远端 llmapi。
+
+## 快速开始
+
+在仓库目录运行 `cargo install --path . --locked`，然后创建 `llmapi.toml`。
+
+```toml
+server = "127.0.0.1:8080"
+apikey = "${LLMAPI_API_KEY}"
+default = "openai"
+
+[providers.openai]
+type = "responses"
+baseurl = "https://api.openai.com/v1"
+apikey = "${OPENAI_API_KEY}"
+```
+
+设置环境变量 `OPENAI_API_KEY` 作为上游凭据，`LLMAPI_API_KEY` 作为客户端访问本服务的密钥。启动服务后，可从另一个终端检查当前配置。
+
+```bash
+llmapi --config llmapi.toml server
+```
+
+```bash
+curl -H "Authorization: Bearer $LLMAPI_API_KEY" http://127.0.0.1:8080/providers
+```
+
+客户端可使用 `http://127.0.0.1:8080/v1` 访问默认 provider，或使用 `http://127.0.0.1:8080/openai/v1` 显式选择 `openai`。完整配置见 [TOML 示例](examples/config.toml) 和 [YAML 示例](examples/config.yaml)。
 
 ## 命令
 
 ```bash
-llmapi list
+llmapi list # 别名 ls、l
 llmapi check [provider] [--model <model>] [--timeout <seconds>]
 llmapi completion [bash|elvish|fish|powershell|zsh] # 别名: comp
-llmapi add <name> --type <chat|responses|messages|llmapi> --baseurl <url> [--apikey|--apikey-stdin]
+llmapi add <name> --type <chat|responses|messages|llmapi> --baseurl <url> [--apikey|--apikey-stdin] # 别名 a
 llmapi add <name> --type lb --members <provider,provider>
 llmapi rm <name>
 llmapi set default <provider>
@@ -48,6 +75,8 @@ llmapi daemon start|stop|restart|status|uninstall|remove
 | OpenAI Chat        | `/chat/completions` | `/{provider}/chat/completions` |
 | OpenAI Responses   | `/responses`        | `/{provider}/responses`        |
 | Anthropic Messages | `/messages`         | `/{provider}/messages`         |
+
+各生成路由均支持 `/v1`，例如 `/v1/responses` 和 `/{provider}/v1/responses`。
 
 当选中的 provider 使用 `openai-responses` 或 `llmapi` 时，`/responses` 也接受 WebSocket 升级。
 
@@ -139,7 +168,7 @@ llmapi set default codex
 
 代理使用本地访问令牌和账户 ID 访问
 `https://chatgpt.com/backend-api/codex`。它**不会刷新令牌，也不会写入
-auth.json**。请继续由 Codex 管理登录；更新最多需要五分钟才能到达 llmapi。上游 401 会直接返回，不重试。凭据不会写入 llmapi 配置，也不会通过 provider 列表暴露。仅使用 `~/.codex/auth.json`；不会发现仅存在于 Keychain 的登录。
+auth.json**。请继续由 Codex 管理登录；更新最多需要五分钟才能到达 llmapi。直连 Codex provider 时，上游 401 会直接返回。凭据不会写入 llmapi 配置，也不会通过 provider 列表暴露。仅使用 `~/.codex/auth.json`；不会发现仅存在于 Keychain 的登录。
 
 支持流式和非流式 HTTP 请求。后端始终使用 `store=false` 的 Responses SSE；非流式客户端会收到最终 JSON 响应。原生 Responses 流会保留上游事件。该 provider 不支持 WebSocket 请求。
 
