@@ -49,9 +49,11 @@ llmapi daemon start|stop|restart|status|uninstall|remove
 | OpenAI Responses   | `/responses`        | `/{provider}/responses`        |
 | Anthropic Messages | `/messages`         | `/{provider}/messages`         |
 
-当选中的 provider 使用 `openai-responses` 时，`/responses` 也接受 WebSocket 升级；WebSocket 消息会透明转发到该 provider。
+当选中的 provider 使用 `openai-responses` 时，`/responses` 也接受 WebSocket 升级。
 
-`GET /models` 和 `GET /v1/models`（也支持 `/{provider}` 前缀）接受上游 OpenAI `data` 或 Codex `models` 列表。Codex 请求（通过 `client_version` 或 Codex User-Agent 识别）收到 `models`；其他客户端收到 OpenAI `data`。格式转换时会补齐缺失的元数据。
+普通 provider 可配置 `models = ["gpt-5", "gpt-5-mini"]`，按区分大小写的模型 ID 限制生成请求。省略 `models` 或设置为空列表时不限制模型。直连 HTTP 请求使用未列出的模型时返回 `400`，WebSocket 请求违反限制时关闭连接，`check --model` 也遵守此限制。
+
+`GET /models` 和 `GET /v1/models`（也支持 `/{provider}` 前缀）接受上游 OpenAI `data` 或 Codex `models` 列表，并按所选 provider 的模型限制过滤。Codex 请求（通过 `client_version` 或 Codex User-Agent 识别）收到 `models`；其他客户端收到 OpenAI `data`。格式转换时会补齐缺失的元数据。
 
 `GET /providers` 返回当前默认 provider 和所有已配置 provider。每个已配置的 `apikey` 返回为 `***`；未设置的密钥会被省略。该端点不会展开环境变量，也不会联系上游 provider。
 
@@ -83,7 +85,7 @@ llmapi set default pool
 llmapi list
 ```
 
-`lb` provider 不接受 `baseurl` 或 `apikey`；`members` 必须是非空、有序且不重复的成员列表。成员必须是现有普通 provider：未知名称、自引用和嵌套 `lb` 都会被拒绝。未配置但自动发现的 `codex` 可以作为成员，运行时凭据不可用则跳过；同名普通 provider 优先。被 `lb` 引用的 provider 在组被修改或删除前不能删除；删除 `lb` 本身不会删除成员。
+`lb` provider 不接受 `baseurl`、`apikey` 或 `models`；`members` 必须是非空、有序且不重复的成员列表。成员必须是现有普通 provider：未知名称、自引用和嵌套 `lb` 都会被拒绝。未配置但自动发现的 `codex` 可以作为成员，运行时凭据不可用则跳过；同名普通 provider 优先。被 `lb` 引用的 provider 在组被修改或删除前不能删除；删除 `lb` 本身不会删除成员。
 
 故障切换只作用于通过 `lb` 发起的请求：
 
@@ -93,6 +95,7 @@ llmapi list
 | 30 秒响应头等待超时                                          | 尝试下一成员             |
 | 上游 `401`、`403`、`408`、`429`、`500..=599`                 | 尝试下一成员             |
 | 成员凭据缺失                                                 | 跳过该成员               |
+| 请求的模型不在成员的允许列表中                               | 跳过该成员               |
 | 其他上游状态（如 `400`、`404`、`422`）                       | 返回该响应               |
 | 本服务鉴权、路由、方法或请求转换错误                         | 立即返回错误             |
 | 已选定响应后的解析错误、响应体读取失败或流中断               | 沿用现有响应错误处理     |
@@ -100,7 +103,7 @@ llmapi list
 
 每次成员尝试最多等待 30 秒响应头，并复用 15 秒连接超时；已建立的 SSE 流不受该 30 秒限制。经 LB 的请求不会自动跟随重定向，因此单次成员尝试最多对应一次上游请求。CLI `check` 对每个成员应用相同的响应头上限，同时保持 `--timeout` 为整条命令的总预算。N 个成员全部耗尽前最多等待约 N × 30 秒，不包含响应体读取时间。所有成员均因可切换结果失败时，客户端收到符合自身协议错误结构的 `503 Service Unavailable`，其中包含 `lb` 名称和简短失败摘要。不会把某个成员的 `Retry-After` 冒充为整组状态。请求体只读取一次，每次尝试都从原始客户端输入重新转换，因此跨协议切换不会复用上一成员转换后的请求体或密钥。`upstream_raw` 返回选定成员的原始响应。故障切换不保证上游恰好执行一次，`idempotency-key` 不会在不同 provider 之间去重。
 
-`GET /models`（也支持 `/v1` 和 `/{provider}`）与生成请求共享轮询游标，只返回选定成员的目录，不合并多个目录。经 LB 的模型列表不转发 `If-None-Match`，也不暴露成员专属 `ETag`；直连 provider 保持原有条件请求行为。依赖上游会话状态的请求（`previous_response_id`、`conversation`）应使用具体 provider 路由，因为 `lb` 可能在请求之间切换成员。模型名不做映射：同一组应放置支持相同模型和能力的 provider。
+`GET /models`（也支持 `/v1` 和 `/{provider}`）与生成请求共享轮询游标，只返回选定成员的目录，不合并多个目录。只有直连且未配置模型限制的 provider 才会转发 `If-None-Match` 并保留原有的 `ETag` 行为。依赖上游会话状态的请求（`previous_response_id`、`conversation`）应使用具体 provider 路由，因为 `lb` 可能在请求之间切换成员。模型名不做映射。
 
 每个生效配置版本原子发布自己的配置和游标。有效配置变更会从零开始新游标，在途请求继续使用旧版本；无效热加载保留上一版本。访问具体 provider 的请求不消耗 `lb` 游标，Codex 凭据轮询不会重置游标。
 

@@ -1,6 +1,6 @@
 use axum::{
     body::{to_bytes, Body},
-    extract::ws::{Message as AxumMessage, WebSocket, WebSocketUpgrade},
+    extract::ws::{close_code, CloseFrame, Message as AxumMessage, WebSocket, WebSocketUpgrade},
     http::{header, HeaderMap, HeaderValue, Method, Response, StatusCode},
 };
 use bytes::{Bytes, BytesMut};
@@ -33,6 +33,7 @@ enum ResponseMode {
     Models {
         codex_client: bool,
         allow_etag: bool,
+        models: Vec<String>,
     },
     /// Transparent same-protocol passthrough.
     Raw,
@@ -285,6 +286,14 @@ pub async fn handle_with_websocket(
     let upstream = provider
         .as_upstream()
         .expect("non-lb provider resolves to an upstream");
+    if let Err(reason) = check_request_model(upstream, &body) {
+        return protocol_error_response(
+            &input,
+            StatusCode::BAD_REQUEST,
+            reason,
+            "invalid_request_error",
+        );
+    }
     if upstream.protocol == Protocol::Codex && state.codex_headers.is_none() {
         return protocol_error_response(
             &input,
@@ -397,7 +406,7 @@ async fn proxy_websocket(
     for (name, value) in &upstream_headers {
         upstream_request.headers_mut().insert(name, value.clone());
     }
-    let (upstream, _) = match tokio_tungstenite::connect_async(upstream_request).await {
+    let (upstream_socket, _) = match tokio_tungstenite::connect_async(upstream_request).await {
         Ok(connection) => connection,
         Err(err) => {
             warn!(target: "llmapi", error = %err, "upstream WebSocket connection failed");
@@ -406,23 +415,60 @@ async fn proxy_websocket(
         }
     };
     let (mut client_sink, mut client_stream) = client.split();
-    let (mut upstream_sink, mut upstream_stream) = upstream.split();
-    tokio::select! {
-        _ = async {
+    let (mut upstream_sink, mut upstream_stream) = upstream_socket.split();
+    let rejected = tokio::select! {
+        reason = async {
             while let Some(message) = client_stream.next().await {
                 let Some(message) = message.ok() else { break };
+                let payload = match &message {
+                    AxumMessage::Text(text) => Some(text.as_bytes()),
+                    AxumMessage::Binary(bytes) => Some(bytes.as_ref()),
+                    _ => None,
+                };
+                if let Some(payload) = payload {
+                    if let Err(reason) = check_request_model(&upstream, payload) {
+                        return Some(reason);
+                    }
+                }
                 let Some(message) = axum_to_tungstenite(message) else { break };
                 if upstream_sink.send(message).await.is_err() { break; }
             }
-        } => {}
+            None
+        } => reason,
         _ = async {
             while let Some(message) = upstream_stream.next().await {
                 let Some(message) = message.ok() else { break };
                 let Some(message) = tungstenite_to_axum(message) else { break; };
                 if client_sink.send(message).await.is_err() { break; }
             }
-        } => {}
+        } => None,
+    };
+    if let Some(reason) = rejected {
+        let _ = client_sink
+            .send(AxumMessage::Close(Some(CloseFrame {
+                code: close_code::POLICY,
+                reason: reason.into(),
+            })))
+            .await;
     }
+}
+
+fn check_request_model(upstream: &UpstreamConfig, body: &[u8]) -> Result<(), &'static str> {
+    if upstream.models.is_empty() {
+        return Ok(());
+    }
+
+    #[derive(serde::Deserialize)]
+    struct RequestModel {
+        model: String,
+    }
+
+    let request = serde_json::from_slice::<RequestModel>(body)
+        .map_err(|_| "request requires a valid model")?;
+    if !upstream.allows_model(&request.model) {
+        return Err("model is not allowed by this provider");
+    }
+    Ok(())
 }
 
 fn axum_to_tungstenite(message: AxumMessage) -> Option<tokio_tungstenite::tungstenite::Message> {
@@ -462,16 +508,21 @@ async fn models_response(
     upstream: reqwest::Response,
     codex_client: bool,
     allow_etag: bool,
+    models: &[String],
 ) -> Response<Body> {
-    let mut response = models_response_inner(upstream, codex_client).await;
+    let mut response = models_response_inner(upstream, codex_client, models).await;
     if !allow_etag {
-        // Never hand out a member-specific validator through the load balancer.
+        // The upstream validator does not describe this catalog.
         response.headers_mut().remove(header::ETAG);
     }
     response
 }
 
-async fn models_response_inner(upstream: reqwest::Response, codex_client: bool) -> Response<Body> {
+async fn models_response_inner(
+    upstream: reqwest::Response,
+    codex_client: bool,
+    allowed_models: &[String],
+) -> Response<Body> {
     if !upstream.status().is_success() {
         let mut response = raw_upstream_response(upstream);
         response
@@ -492,7 +543,7 @@ async fn models_response_inner(upstream: reqwest::Response, codex_client: bool) 
             )
         }
     };
-    let value: Value = match serde_json::from_slice(&body) {
+    let mut value: Value = match serde_json::from_slice(&body) {
         Ok(value) => value,
         Err(err) => {
             return protocol_error_response(
@@ -510,7 +561,7 @@ async fn models_response_inner(upstream: reqwest::Response, codex_client: bool) 
     };
     let native = value.get(desired_key).and_then(Value::as_array).is_some()
         && value.get(other_key).is_none();
-    if native {
+    if native && allowed_models.is_empty() {
         let mut response = response(status, body, "application/json");
         copy_response_metadata_headers(&headers, response.headers_mut());
         if let Some(etag) = headers.get(header::ETAG) {
@@ -520,6 +571,9 @@ async fn models_response_inner(upstream: reqwest::Response, codex_client: bool) 
             .headers_mut()
             .append(header::VARY, HeaderValue::from_static("User-Agent"));
         return response;
+    }
+    if !allowed_models.is_empty() {
+        models::restrict_catalog(&mut value, allowed_models);
     }
     let output = match models::for_client(value, codex_client) {
         Ok(output) => output,
@@ -553,6 +607,7 @@ fn plan_models(
     allow_etag: bool,
     follow_redirects: bool,
 ) -> RequestPlan {
+    let allow_etag = allow_etag && upstream.models.is_empty();
     let mut url = upstream_url(&upstream.base_url, "/models", query);
     if upstream.protocol == Protocol::Codex && !has_client_version(query) {
         url.push(if url.contains('?') { '&' } else { '?' });
@@ -571,8 +626,8 @@ fn plan_models(
         mode: ResponseMode::Models {
             codex_client,
             allow_etag,
+            models: upstream.models.clone(),
         },
-        // A load-balancer catalog must not depend on a single member's validator.
         conditional: allow_etag,
         follow_redirects,
     }
@@ -782,7 +837,8 @@ async fn build_response(mode: ResponseMode, upstream: reqwest::Response) -> Resp
         ResponseMode::Models {
             codex_client,
             allow_etag,
-        } => models_response(upstream, codex_client, allow_etag).await,
+            models,
+        } => models_response(upstream, codex_client, allow_etag, &models).await,
         ResponseMode::Raw | ResponseMode::RawUpstream => raw_upstream_response(upstream),
         ResponseMode::Converted {
             input,
@@ -847,6 +903,11 @@ async fn attempt_member(
     else {
         return Attempt::Switch("provider is not configured".into());
     };
+    if let LbRequest::Generate { body, .. } = request {
+        if let Err(reason) = check_request_model(upstream, body) {
+            return Attempt::Switch(reason.into());
+        }
+    }
     if upstream.protocol == Protocol::Codex && state.codex_headers.is_none() {
         return Attempt::Switch("Codex credentials are unavailable".into());
     }

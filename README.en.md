@@ -86,11 +86,17 @@ the last valid config; changing the selected config path requires a restart.
 | Anthropic Messages | `/messages`         | `/{provider}/messages`         |
 
 `/responses` also accepts a WebSocket upgrade when the selected provider uses
-`openai-responses`; WebSocket messages are forwarded transparently to that
-provider.
+`openai-responses`.
+
+A concrete provider can set `models = ["gpt-5", "gpt-5-mini"]` to allow only
+those case-sensitive model IDs. Omit `models` or use an empty list to allow
+any model. Direct HTTP requests for disallowed models return `400`.
+WebSocket requests that violate the restriction close the connection.
+`check --model` also honors the list.
 
 `GET /models` and `GET /v1/models` (also under `/{provider}`) accept upstream
-OpenAI `data` or Codex `models` lists. Codex requests (identified by
+OpenAI `data` or Codex `models` lists and filter them by the selected
+provider's model allowlist. Codex requests (identified by
 `client_version` or a Codex User-Agent) receive `models`; other clients receive
 OpenAI `data`. Missing metadata is synthesized when converting between formats.
 
@@ -130,7 +136,7 @@ llmapi set default pool
 llmapi list
 ```
 
-`lb` providers do not accept `baseurl` or `apikey`; `members` must be a
+`lb` providers do not accept `baseurl`, `apikey`, or `models`; `members` must be a
 non-empty, ordered list without duplicates. Members must be existing concrete
 providers: unknown names, self references, and nested `lb` providers are
 rejected. The automatically discovered `codex` provider may be referenced even
@@ -147,6 +153,7 @@ Failover applies only to requests that go through an `lb` group:
 | 30-second response-header timeout                                        | try the next member               |
 | Upstream `401`, `403`, `408`, `429`, `500..=599`                         | try the next member               |
 | Missing member credentials                                               | skip the member                   |
+| Requested model excluded by the member's allowlist                       | skip the member                   |
 | Other upstream statuses (for example `400`, `404`, `422`)                | return the response               |
 | Client auth, routing, method, or request conversion errors               | return the error immediately      |
 | Parse failures, read failures, or stream breaks after a response is chosen | keep the existing error handling |
@@ -169,12 +176,11 @@ response. Failover does not guarantee exactly-once upstream execution, and
 
 `GET /models` (also under `/v1` and `/{provider}`) uses the same round-robin
 cursor and returns the selected member's catalog without merging directories.
-Load-balanced model requests do not forward `If-None-Match` and do not expose a
-member `ETag`; direct providers keep their conditional-request behavior.
+Only direct providers without a model restriction forward `If-None-Match`
+and retain the existing `ETag` behavior.
 Session state stored by an upstream (`previous_response_id`, `conversation`)
 should be sent to a concrete provider route, because an `lb` group may switch
-members between requests. Model names are not mapped: put providers that serve
-the same models and capabilities in one group.
+members between requests. Model names are not mapped.
 
 Each config version keeps its own cursors and publishes them atomically with
 the config. A valid config change starts the new cursors at zero and leaves

@@ -502,6 +502,12 @@ async fn send_probe(
     timeout: Option<Duration>,
     header_timeout: Option<Duration>,
 ) -> Result<ProbeResponse> {
+    if let Some(model) = model {
+        anyhow::ensure!(
+            upstream.allows_model(model),
+            "model is not allowed by this provider"
+        );
+    }
     let api_key = upstream.api_key()?;
     let mut headers = HeaderMap::new();
     auth::apply_api_key(&mut headers, upstream.protocol, api_key.as_deref(), None);
@@ -1354,24 +1360,23 @@ mod tests {
             }),
         ))
         .await;
-        let provider = upstream_config(
+        let mut provider = upstream_config(
             Protocol::OpenAiChat,
             format!("{upstream}/v1"),
             Some("sk-test"),
         );
+        provider.models = vec!["deepseek-chat".into()];
+        let client = reqwest::Client::new();
 
-        let outcome = probe_provider(
-            &reqwest::Client::new(),
-            &provider,
-            None,
-            Some("deepseek-chat"),
-            None,
-        )
-        .await
-        .unwrap();
+        let outcome = probe_provider(&client, &provider, None, Some("deepseek-chat"), None)
+            .await
+            .unwrap();
 
         assert_eq!(outcome.status.as_u16(), 200);
         assert_eq!(outcome.detail, "reply: pong");
+
+        let rejected = probe_provider(&client, &provider, None, Some("other-model"), None).await;
+        assert!(matches!(rejected, Err(err) if err.to_string().contains("model is not allowed")));
     }
 
     #[tokio::test]
@@ -1575,6 +1580,7 @@ mod tests {
             protocol: Protocol::OpenAiChat,
             base_url: format!("http://alice:s3cr3t-url-pass@{host}/v1"),
             api_key: None,
+            models: Vec::new(),
         };
         let secrets = probe_secrets(&upstream, None);
         assert!(
@@ -1625,6 +1631,7 @@ mod tests {
             protocol: Protocol::OpenAiChat,
             base_url: format!("{rejected}/v1?api_key=sk-query-secret"),
             api_key: None,
+            models: Vec::new(),
         };
         let secrets = probe_secrets(&upstream, None);
         assert!(
@@ -1700,6 +1707,7 @@ mod tests {
                 protocol: Protocol::OpenAiChat,
                 base_url: format!("http://{userinfo}@{host}/v1"),
                 api_key: None,
+                models: Vec::new(),
             };
             let expected = format!("Basic {}", base64_encode(payload.as_bytes()));
             let secrets = probe_secrets(&upstream, None);
@@ -1758,6 +1766,7 @@ mod tests {
             protocol: Protocol::OpenAiChat,
             base_url: format!("{rejected}/v1?api_key=sk%2Dquery%2Dsecret"),
             api_key: None,
+            models: Vec::new(),
         };
         let secrets = probe_secrets(&upstream, None);
         for expected in ["sk%2Dquery%2Dsecret", "sk-query-secret"] {
@@ -1816,6 +1825,7 @@ mod tests {
             protocol: Protocol::OpenAiChat,
             base_url: format!("http://alice:p%22ass-word@{host}/v1"),
             api_key: None,
+            models: Vec::new(),
         };
         let secrets = probe_secrets(&upstream, None);
         assert!(secrets.iter().any(|value| value == secret), "{secrets:?}");

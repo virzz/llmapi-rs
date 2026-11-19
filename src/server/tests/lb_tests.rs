@@ -110,6 +110,100 @@ async fn post_chat(path: String) -> reqwest::Response {
 }
 
 #[tokio::test]
+async fn model_allowlist_rejects_direct_requests_and_skips_ineligible_members() {
+    let (a, a_calls) = chat_member("a").await;
+    let (b, b_calls) = chat_member("b").await;
+    let mut config = config_with(
+        &["a", "b"],
+        &[
+            ("a", &a, Protocol::OpenAiChat),
+            ("b", &b, Protocol::OpenAiChat),
+        ],
+    );
+    for (provider, model) in [("a", "other-model"), ("b", "shared-model")] {
+        config
+            .providers
+            .get_mut(provider)
+            .unwrap()
+            .as_upstream_mut()
+            .unwrap()
+            .models = vec![model.into()];
+    }
+    let proxy = start_proxy(config).await;
+
+    for path in ["chat/completions", "messages"] {
+        let response = post_chat(format!("http://{proxy}/a/{path}")).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(response
+            .text()
+            .await
+            .unwrap()
+            .contains("model is not allowed"));
+    }
+
+    let response = post_chat(format!("http://{proxy}/pool/chat/completions")).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.json::<Value>().await.unwrap()["choices"][0]["message"]["content"],
+        "b"
+    );
+    let response = reqwest::Client::new()
+        .post(format!("http://{proxy}/pool/chat/completions"))
+        .json(&json!({"model": "unknown-model"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(a_calls.count(), 0);
+    assert_eq!(b_calls.count(), 1);
+}
+
+#[tokio::test]
+async fn model_allowlist_filters_native_and_converted_catalogs() {
+    let (a, _) = json_member(
+        StatusCode::OK,
+        json!({"data": [{"id": "allowed"}, {"id": "other"}]}),
+    )
+    .await;
+    let (b, _) = json_member(
+        StatusCode::OK,
+        json!({"models": [{"slug": "allowed"}, {"slug": "other"}]}),
+    )
+    .await;
+    let mut config = config_with(
+        &["a", "b"],
+        &[
+            ("a", &a, Protocol::OpenAiChat),
+            ("b", &b, Protocol::OpenAiChat),
+        ],
+    );
+    for provider in ["a", "b"] {
+        config
+            .providers
+            .get_mut(provider)
+            .unwrap()
+            .as_upstream_mut()
+            .unwrap()
+            .models = vec!["allowed".into()];
+    }
+    let proxy = start_proxy(config).await;
+
+    for provider in ["a", "b", "pool"] {
+        for (query, list, id) in [("", "data", "id"), ("?client_version=1", "models", "slug")] {
+            let body: Value = reqwest::get(format!("http://{proxy}/{provider}/models{query}"))
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            let models = body[list].as_array().unwrap();
+            assert_eq!(models.len(), 1);
+            assert_eq!(models[0][id], "allowed");
+        }
+    }
+}
+
+#[tokio::test]
 async fn rotates_starting_member_across_sequential_requests() {
     let (a, a_calls) = models_member("a").await;
     let (b, b_calls) = models_member("b").await;
@@ -986,6 +1080,39 @@ async fn concrete_responses_provider_websocket_still_works() {
         .unwrap();
     let reply = socket.next().await.unwrap().unwrap();
     assert_eq!(reply.to_text().unwrap(), "echo:hi");
+}
+
+#[tokio::test]
+async fn websocket_enforces_the_allowlist_on_each_request() {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::{protocol::frame::coding::CloseCode, Message};
+
+    let upstream = serve(Router::new().route("/responses", any(ws_echo))).await;
+    let mut config = config_with(&["a"], &[("a", &upstream, Protocol::OpenAiResponses)]);
+    config
+        .providers
+        .get_mut("a")
+        .unwrap()
+        .as_upstream_mut()
+        .unwrap()
+        .models = vec!["allowed".into()];
+    let proxy = start_proxy(config).await;
+    let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{proxy}/a/responses"))
+        .await
+        .unwrap();
+
+    let allowed = json!({"type": "response.create", "model": "allowed"}).to_string();
+    socket
+        .send(Message::Text(allowed.clone().into()))
+        .await
+        .unwrap();
+    let reply = socket.next().await.unwrap().unwrap();
+    assert_eq!(reply.to_text().unwrap(), format!("echo:{allowed}"));
+
+    let rejected = json!({"type": "response.create", "model": "other"}).to_string();
+    socket.send(Message::Text(rejected.into())).await.unwrap();
+    let reply = socket.next().await.unwrap().unwrap();
+    assert!(matches!(reply, Message::Close(Some(frame)) if frame.code == CloseCode::Policy));
 }
 
 #[derive(Clone)]

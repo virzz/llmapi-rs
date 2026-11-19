@@ -13,6 +13,18 @@ pub fn is_codex_client(headers: &HeaderMap, query: Option<&str>) -> bool {
         .is_some_and(|value| value.to_ascii_lowercase().starts_with("codex"))
 }
 
+pub fn restrict_catalog(value: &mut Value, models: &[String]) {
+    for (list, id) in [("data", "id"), ("models", "slug")] {
+        if let Some(entries) = value.get_mut(list).and_then(Value::as_array_mut) {
+            entries.retain(|entry| {
+                entry[id]
+                    .as_str()
+                    .is_some_and(|id| models.iter().any(|allowed| allowed == id))
+            });
+        }
+    }
+}
+
 pub fn for_client(value: Value, codex: bool) -> Result<Value, &'static str> {
     if codex {
         if value.get("models").and_then(Value::as_array).is_some() {

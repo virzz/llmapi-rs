@@ -47,6 +47,8 @@ pub struct UpstreamConfig {
     pub protocol: Protocol,
     pub base_url: String,
     pub api_key: Option<String>,
+    /// Allowed model IDs. An empty list allows any model.
+    pub models: Vec<String>,
 }
 
 /// A round-robin load-balancer group over existing providers.
@@ -310,6 +312,7 @@ impl ProviderConfig {
             protocol,
             base_url: base_url.into(),
             api_key,
+            models: Vec::new(),
         })
     }
 
@@ -410,6 +413,10 @@ impl ProviderConfig {
 }
 
 impl UpstreamConfig {
+    pub(crate) fn allows_model(&self, model: &str) -> bool {
+        self.models.is_empty() || self.models.iter().any(|allowed| allowed == model)
+    }
+
     pub fn api_key(&self) -> Result<Option<String>, ConfigError> {
         self.api_key.clone().map(expand_env).transpose()
     }
@@ -514,6 +521,8 @@ struct ProviderConfigRaw {
     )]
     api_key: Option<Option<String>>,
     #[serde(default, deserialize_with = "deserialize_present")]
+    models: Option<Option<Vec<String>>>,
+    #[serde(default, deserialize_with = "deserialize_present")]
     members: Option<Option<Vec<String>>>,
 }
 
@@ -526,6 +535,9 @@ impl ProviderConfigRaw {
                 }
                 if self.api_key.is_some() {
                     return Err("lb provider does not accept `apikey`".into());
+                }
+                if self.models.is_some() {
+                    return Err("lb provider does not accept `models`".into());
                 }
                 let members = match self.members {
                     Some(Some(members)) => members,
@@ -549,11 +561,12 @@ impl ProviderConfigRaw {
                 };
                 let protocol = Protocol::from_provider(provider_type)
                     .ok_or_else(|| format!("unknown provider type: {provider_type}"))?;
-                Ok(ProviderConfig::upstream(
+                Ok(ProviderConfig::Upstream(UpstreamConfig {
                     protocol,
                     base_url,
-                    self.api_key.flatten(),
-                ))
+                    api_key: self.api_key.flatten(),
+                    models: self.models.flatten().unwrap_or_default(),
+                }))
             }
         }
     }
@@ -577,6 +590,8 @@ struct UpstreamWire<'a> {
     baseurl: &'a str,
     #[serde(rename = "apikey", skip_serializing_if = "Option::is_none")]
     api_key: Option<&'a str>,
+    #[serde(skip_serializing_if = "<[String]>::is_empty")]
+    models: &'a [String],
 }
 
 #[derive(Serialize)]
@@ -596,6 +611,7 @@ impl Serialize for ProviderConfig {
                 provider_type: upstream.protocol.as_str(),
                 baseurl: &upstream.base_url,
                 api_key: upstream.api_key.as_deref(),
+                models: &upstream.models,
             }
             .serialize(serializer),
             Self::Lb(lb) => LbWire {
@@ -690,6 +706,27 @@ providers:
     type: lb
     members: [primary, secondary]
 "#;
+
+    #[test]
+    fn upstream_models_round_trip_with_an_optional_allowlist() {
+        for (configured, expected) in [
+            ("", vec![]),
+            ("\nmodels: []", vec![]),
+            ("\nmodels: [model-a, model-b]", vec!["model-a", "model-b"]),
+        ] {
+            let provider: ProviderConfig = serde_yaml::from_str(&format!(
+                "type: chat\nbaseurl: https://example.test{configured}"
+            ))
+            .unwrap();
+            assert_eq!(provider.as_upstream().unwrap().models, expected);
+            let serialized = serde_json::to_value(&provider).unwrap();
+            assert_eq!(serialized.get("models").is_some(), !expected.is_empty());
+            assert_eq!(
+                serde_json::from_value::<ProviderConfig>(serialized).unwrap(),
+                provider
+            );
+        }
+    }
 
     #[test]
     fn automatic_codex_preserves_configured_providers_and_default() {

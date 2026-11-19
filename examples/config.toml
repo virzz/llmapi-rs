@@ -12,11 +12,13 @@ apikey = "${DEEPSEEK_API_KEY}"
 type = "responses"
 baseurl = "https://api.openai.com/v1"
 apikey = "${OPENAI_API_KEY}"
+models = ["gpt-5", "gpt-5-mini"]
 
 [providers.anthropic]
 type = "messages"
 baseurl = "https://api.anthropic.com/v1"
 apikey = "${ANTHROPIC_API_KEY}"
+models = [] # An empty list allows any model.
 
 [providers.pool]
 type = "lb"
