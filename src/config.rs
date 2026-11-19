@@ -63,6 +63,7 @@ pub enum Protocol {
     OpenAiChat,
     OpenAiResponses,
     Anthropic,
+    Llmapi,
     Codex,
 }
 
@@ -77,6 +78,10 @@ pub enum Provider {
     #[serde(rename = "anthropic", alias = "messages")]
     #[value(name = "anthropic", alias = "messages")]
     Anthropic,
+    /// Relay to another llmapi server using the client's protocol.
+    #[serde(rename = "llmapi")]
+    #[value(name = "llmapi")]
+    Llmapi,
     /// Discovered from the local Codex login; never stored as provider config.
     #[serde(rename = "codex", skip_deserializing)]
     #[value(skip)]
@@ -432,6 +437,7 @@ impl Provider {
             Self::OpenAiChat => "openai-chat",
             Self::OpenAiResponses => "openai-responses",
             Self::Anthropic => "anthropic",
+            Self::Llmapi => "llmapi",
             Self::Codex => "codex",
             Self::Lb => LB_TYPE,
         }
@@ -443,6 +449,7 @@ impl Provider {
             Self::OpenAiChat => Some(Protocol::OpenAiChat),
             Self::OpenAiResponses => Some(Protocol::OpenAiResponses),
             Self::Anthropic => Some(Protocol::Anthropic),
+            Self::Llmapi => Some(Protocol::Llmapi),
             Self::Codex => Some(Protocol::Codex),
             Self::Lb => None,
         }
@@ -455,6 +462,7 @@ impl Protocol {
             Self::OpenAiChat => "openai-chat",
             Self::OpenAiResponses => "openai-responses",
             Self::Anthropic => "anthropic",
+            Self::Llmapi => "llmapi",
             Self::Codex => "codex",
         }
     }
@@ -484,6 +492,7 @@ impl FromStr for Provider {
             "openai-chat" | "chat" => Ok(Self::OpenAiChat),
             "openai-responses" | "responses" => Ok(Self::OpenAiResponses),
             "anthropic" | "messages" => Ok(Self::Anthropic),
+            "llmapi" => Ok(Self::Llmapi),
             LB_TYPE => Ok(Self::Lb),
             other => Err(ConfigError::UnknownProviderType(other.to_string())),
         }
@@ -504,7 +513,7 @@ where
 /// Wire form used while deserializing, then split into upstream/lb.
 #[derive(Deserialize)]
 struct ProviderConfigRaw {
-    #[serde(rename = "type")]
+    #[serde(rename = "type", alias = "upstream")]
     provider_type: Provider,
     #[serde(
         rename = "baseurl",
@@ -706,6 +715,20 @@ providers:
     type: lb
     members: [primary, secondary]
 "#;
+
+    #[test]
+    fn parses_llmapi_relay_from_upstream_and_serializes_as_type() {
+        let provider: ProviderConfig =
+            toml::from_str("upstream = \"llmapi\"\nbaseurl = \"https://relay.test/pool/v1\"")
+                .unwrap();
+        assert_eq!(provider.protocol(), Some(Protocol::Llmapi));
+        let serialized = serde_json::to_value(&provider).unwrap();
+        assert_eq!(serialized["type"], "llmapi");
+        assert_eq!(
+            serde_json::from_value::<ProviderConfig>(serialized).unwrap(),
+            provider
+        );
+    }
 
     #[test]
     fn upstream_models_round_trip_with_an_optional_allowlist() {

@@ -20,13 +20,14 @@ use super::{
     lb,
     model::{LLMRequest, LLMResponse},
     models,
-    protocol::{detect_route, is_transparent, upstream_for, InputFormat, UpstreamFormat},
+    protocol::{detect_route, is_transparent, upstream_for_input, InputFormat, UpstreamFormat},
     redact,
     server::AppState,
 };
 
 pub(crate) const MAX_JSON_BODY_BYTES: usize = 64 * 1024 * 1024;
 pub(crate) const MAX_ERROR_BODY_BYTES: usize = 1024 * 1024;
+const RESPONSE_MODE_HEADER: &str = "x-llmapi-response-mode";
 
 /// How an upstream response becomes a client response.
 enum ResponseMode {
@@ -151,11 +152,14 @@ pub async fn handle_with_websocket(
                 "invalid_request_error",
             );
         };
-        if upstream.protocol != Protocol::OpenAiResponses {
+        if !matches!(
+            upstream.protocol,
+            Protocol::OpenAiResponses | Protocol::Llmapi
+        ) {
             return protocol_error_response(
                 &route.input,
                 StatusCode::BAD_REQUEST,
-                "WebSocket requires an openai-responses provider",
+                "WebSocket requires an openai-responses or llmapi provider",
                 "invalid_request_error",
             );
         }
@@ -666,7 +670,7 @@ fn plan_generate(
         upstream_raw,
         follow_redirects,
     } = request;
-    let (upstream_format, path) = upstream_for(upstream.protocol);
+    let (upstream_format, path) = upstream_for_input(upstream.protocol, input);
     let url = upstream_url(&upstream.base_url, path, query);
     let make = |body: Bytes, derived_headers: HeaderMap, mode: ResponseMode| RequestPlan {
         protocol: upstream.protocol,
@@ -683,7 +687,14 @@ fn plan_generate(
     };
     if upstream.protocol != Protocol::Codex && is_transparent(input, upstream_format) {
         debug!(target: "llmapi", path, "transparent proxy");
-        return Ok(make(body.clone(), HeaderMap::new(), ResponseMode::Raw));
+        let mut derived_headers = HeaderMap::new();
+        if upstream_raw && upstream.protocol == Protocol::Llmapi {
+            derived_headers.insert(
+                RESPONSE_MODE_HEADER,
+                HeaderValue::from_static("upstream_raw"),
+            );
+        }
+        return Ok(make(body.clone(), derived_headers, ResponseMode::Raw));
     }
 
     debug!(target: "llmapi", ?input, ?upstream_format, "protocol adapter selected");
@@ -1500,7 +1511,7 @@ fn stream_error_events(
 
 fn wants_upstream_raw(uri: &axum::http::Uri, headers: &HeaderMap) -> bool {
     if headers
-        .get("x-llmapi-response-mode")
+        .get(RESPONSE_MODE_HEADER)
         .and_then(|value| value.to_str().ok())
         == Some("upstream_raw")
     {

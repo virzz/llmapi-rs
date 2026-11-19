@@ -1039,6 +1039,146 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn llmapi_relay_routes_each_protocol_through_the_remote_provider() {
+        let (upstream, captured) = start_upstream(json!({
+            "id": "resp_relay",
+            "object": "response",
+            "model": "shared-model",
+            "output_text": "relayed",
+            "status": "completed"
+        }))
+        .await;
+        let mut remote = test_config(&upstream);
+        remote.api_key = Some("remote-key".into());
+        let remote = start_proxy(remote).await;
+        let mut local = Config {
+            default: "relay".into(),
+            api_key: Some("local-key".into()),
+            ..Config::default()
+        };
+        local.providers.insert(
+            "relay".into(),
+            ProviderConfig::upstream(
+                Protocol::Llmapi,
+                format!("http://{remote}/openai/v1"),
+                Some("remote-key".into()),
+            ),
+        );
+        let local = start_proxy(local).await;
+        let client = reqwest::Client::new();
+        let messages = json!([{"role": "user", "content": "hi"}]);
+
+        for (path, payload, pointer) in [
+            (
+                "chat/completions",
+                json!({"model": "shared-model", "messages": messages}),
+                "/choices/0/message/content",
+            ),
+            (
+                "responses",
+                json!({"model": "shared-model", "input": "hi", "previous_response_id": "resp_old"}),
+                "/output_text",
+            ),
+            (
+                "messages",
+                json!({"model": "shared-model", "messages": messages, "max_tokens": 16}),
+                "/content/0/text",
+            ),
+        ] {
+            let response = client
+                .post(format!(
+                    "http://{local}/relay/v1/{path}?key=local-key&trace=test"
+                ))
+                .header("openai-beta", "responses=v1")
+                .json(&payload)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body: Value = response.json().await.unwrap();
+            assert_eq!(body.pointer(pointer).unwrap(), "relayed");
+            let request = captured.lock().await;
+            let request = request.as_ref().unwrap();
+            assert_eq!(
+                request.uri.path_and_query().unwrap().as_str(),
+                "/responses?trace=test"
+            );
+            assert_eq!(request.headers["authorization"], "Bearer sk-openai");
+            assert_eq!(request.headers["openai-beta"], "responses=v1");
+            assert_eq!(request.body["model"], "shared-model");
+            if path == "responses" {
+                assert_eq!(request.body, payload);
+            }
+        }
+
+        let raw: Value = client
+            .post(format!(
+                "http://{local}/relay/messages?llmapi_response_mode=upstream_raw"
+            ))
+            .bearer_auth("local-key")
+            .json(&json!({"model": "shared-model", "messages": messages, "max_tokens": 16}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(raw["output_text"], "relayed");
+    }
+
+    #[tokio::test]
+    async fn llmapi_relay_preserves_codex_catalog_metadata() {
+        let catalog = json!({"models": [{"slug": "shared-model", "context_window": 42}]});
+        let (upstream, _) = start_upstream(catalog.clone()).await;
+        let remote = start_proxy(test_config(&upstream)).await;
+        let local = Config {
+            default: "relay".into(),
+            providers: BTreeMap::from([(
+                "relay".into(),
+                ProviderConfig::upstream(Protocol::Llmapi, format!("http://{remote}"), None),
+            )]),
+            ..Config::default()
+        };
+        let local = start_proxy(local).await;
+
+        let received: Value = reqwest::Client::new()
+            .get(format!("http://{local}/models"))
+            .header("user-agent", "codex_cli/test")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(received, catalog);
+    }
+
+    #[tokio::test]
+    async fn llmapi_relay_preserves_sse() {
+        let stream = "event: response.completed\ndata: {\"type\":\"response.completed\"}\n\n";
+        let (upstream, _) = start_stream_upstream(vec![stream.as_bytes().to_vec()]).await;
+        let remote = start_proxy(test_config(&upstream)).await;
+        let local = Config {
+            default: "relay".into(),
+            providers: BTreeMap::from([(
+                "relay".into(),
+                ProviderConfig::upstream(Protocol::Llmapi, format!("http://{remote}/openai"), None),
+            )]),
+            ..Config::default()
+        };
+        let local = start_proxy(local).await;
+
+        let response = reqwest::Client::new()
+            .post(format!("http://{local}/responses"))
+            .json(&json!({"model": "shared-model", "input": "hi", "stream": true}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.headers()["content-type"], "text/event-stream");
+        assert_eq!(response.text().await.unwrap(), stream);
+    }
+
+    #[tokio::test]
     async fn rejects_unknown_route_and_provider() {
         let (upstream, _) = start_upstream(json!({})).await;
         let proxy = start_proxy(test_config(&upstream)).await;

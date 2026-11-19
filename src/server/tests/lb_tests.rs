@@ -1066,11 +1066,22 @@ async fn ws_echo(ws: WebSocketUpgrade) -> Response<Body> {
 }
 
 #[tokio::test]
-async fn concrete_responses_provider_websocket_still_works() {
+async fn llmapi_relay_supports_responses_websocket() {
     let upstream = serve(Router::new().route("/responses", any(ws_echo))).await;
-    let config = config_with(&["a"], &[("a", &upstream, Protocol::OpenAiResponses)]);
+    let mut config = config_with(&["a"], &[("a", &upstream, Protocol::OpenAiResponses)]);
+    config.api_key = Some("remote-key".into());
     let proxy = start_proxy(config).await;
-    let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{proxy}/a/responses"))
+    let remote = format!("http://{proxy}/a");
+    let mut relay = config_with(&["relay"], &[("relay", &remote, Protocol::Llmapi)]);
+    relay
+        .providers
+        .get_mut("relay")
+        .unwrap()
+        .as_upstream_mut()
+        .unwrap()
+        .api_key = Some("remote-key".into());
+    let local = start_proxy(relay).await;
+    let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{local}/relay/responses"))
         .await
         .unwrap();
     use futures_util::{SinkExt, StreamExt};

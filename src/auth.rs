@@ -33,7 +33,7 @@ pub fn apply_api_key(
 
     match protocol {
         Protocol::Codex => {}
-        Protocol::OpenAiChat | Protocol::OpenAiResponses => {
+        Protocol::OpenAiChat | Protocol::OpenAiResponses | Protocol::Llmapi => {
             if let Ok(value) = HeaderValue::from_str(&format!("Bearer {key}")) {
                 headers.insert(header::AUTHORIZATION, value);
             }
@@ -73,6 +73,20 @@ pub fn apply_protocol_headers(headers: &mut HeaderMap, protocol: Protocol, sourc
                     if let Some(value) = source.get(name) {
                         headers.insert(name, value.clone());
                     }
+                }
+            }
+        }
+        Protocol::Llmapi => {
+            for name in [
+                "anthropic-version",
+                "anthropic-beta",
+                "openai-beta",
+                "session-id",
+                "thread-id",
+                "user-agent",
+            ] {
+                if let Some(value) = source.get(name) {
+                    headers.insert(name, value.clone());
                 }
             }
         }

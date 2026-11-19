@@ -73,7 +73,7 @@ enum Command {
 struct AddArgs {
     /// Provider name used in HTTP route prefixes
     name: String,
-    /// Provider type: openai-chat|chat, openai-responses|responses, anthropic|messages, lb
+    /// Provider type: openai-chat|chat, openai-responses|responses, anthropic|messages, llmapi, lb
     #[arg(long = "type")]
     provider_type: Provider,
     /// Upstream API base URL (required unless --members is used)
@@ -518,7 +518,7 @@ async fn send_probe(
     let codex = upstream.protocol == Protocol::Codex;
     let (method, path, body) = match (upstream.protocol, model) {
         (_, None) => (Method::GET, "/models", None),
-        (Protocol::OpenAiChat, Some(model)) => (
+        (Protocol::OpenAiChat | Protocol::Llmapi, Some(model)) => (
             Method::POST,
             "/chat/completions",
             Some(json!({
@@ -809,7 +809,9 @@ fn response_text(protocol: Protocol, body: &[u8]) -> Option<String> {
     let value: Value = serde_json::from_slice(body).ok()?;
     let text =
         match protocol {
-            Protocol::OpenAiChat => json_text(&value["choices"][0]["message"]["content"]),
+            Protocol::OpenAiChat | Protocol::Llmapi => {
+                json_text(&value["choices"][0]["message"]["content"])
+            }
             Protocol::OpenAiResponses => value
                 .get("output_text")
                 .and_then(Value::as_str)

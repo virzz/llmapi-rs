@@ -49,14 +49,29 @@ fn detect_endpoint(path: &str) -> Option<InputFormat> {
     }
 }
 
+/// Canonical upstream endpoint. Chat is the default for a relay without a client format.
 pub fn upstream_for(protocol: Protocol) -> (UpstreamFormat, &'static str) {
     match protocol {
-        Protocol::OpenAiChat => (UpstreamFormat::OpenAiChat, "/chat/completions"),
+        Protocol::OpenAiChat | Protocol::Llmapi => {
+            (UpstreamFormat::OpenAiChat, "/chat/completions")
+        }
         Protocol::OpenAiResponses | Protocol::Codex => {
             (UpstreamFormat::OpenAiResponses, "/responses")
         }
         Protocol::Anthropic => (UpstreamFormat::AnthropicMessages, "/messages"),
     }
+}
+
+pub(crate) fn upstream_for_input(
+    protocol: Protocol,
+    input: InputFormat,
+) -> (UpstreamFormat, &'static str) {
+    let protocol = match (protocol, input) {
+        (Protocol::Llmapi, InputFormat::OpenAiResponses) => Protocol::OpenAiResponses,
+        (Protocol::Llmapi, InputFormat::AnthropicMessages) => Protocol::Anthropic,
+        _ => protocol,
+    };
+    upstream_for(protocol)
 }
 
 pub fn is_transparent(input: InputFormat, upstream: UpstreamFormat) -> bool {

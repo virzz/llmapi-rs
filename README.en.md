@@ -11,7 +11,7 @@ Completions, OpenAI Responses, and Anthropic Messages APIs.
 llmapi list
 llmapi check [provider] [--model <model>] [--timeout <seconds>]
 llmapi completion [bash|elvish|fish|powershell|zsh] # alias: comp
-llmapi add <name> --type <chat|responses|messages> --baseurl <url> [--apikey|--apikey-stdin]
+llmapi add <name> --type <chat|responses|messages|llmapi> --baseurl <url> [--apikey|--apikey-stdin]
 llmapi add <name> --type lb --members <provider,provider>
 llmapi rm <name>
 llmapi set default <provider>
@@ -86,7 +86,7 @@ the last valid config; changing the selected config path requires a restart.
 | Anthropic Messages | `/messages`         | `/{provider}/messages`         |
 
 `/responses` also accepts a WebSocket upgrade when the selected provider uses
-`openai-responses`.
+`openai-responses` or `llmapi`.
 
 A concrete provider can set `models = ["gpt-5", "gpt-5-mini"]` to allow only
 those case-sensitive model IDs. Omit `models` or use an empty list to allow
@@ -103,6 +103,23 @@ OpenAI `data`. Missing metadata is synthesized when converting between formats.
 `GET /providers` returns the active default and all configured providers. Each
 configured `apikey` is returned as `***`; unset keys are omitted. The endpoint
 does not resolve environment variables or contact upstream providers.
+
+## llmapi relay
+
+```toml
+[providers.relay]
+upstream = "llmapi" # Also accepts type = "llmapi".
+baseurl = "https://remote.example.com/pool/v1"
+apikey = "${REMOTE_LLMAPI_API_KEY}"
+```
+
+The relay forwards Chat Completions, Responses, Messages, SSE, and model lists
+in the client's protocol. The remote llmapi selects the upstream and performs
+protocol conversion. Set `baseurl` to the remote server address for its default
+provider, or append a prefix such as `/pool/v1` to select a named provider.
+Responses WebSocket upgrades require support from the selected remote provider.
+Set `apikey` to the remote llmapi server key. `check --model` uses the remote
+Chat Completions endpoint.
 
 ## Load-balancer provider
 

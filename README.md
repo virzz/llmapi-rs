@@ -10,7 +10,7 @@
 llmapi list
 llmapi check [provider] [--model <model>] [--timeout <seconds>]
 llmapi completion [bash|elvish|fish|powershell|zsh] # 别名: comp
-llmapi add <name> --type <chat|responses|messages> --baseurl <url> [--apikey|--apikey-stdin]
+llmapi add <name> --type <chat|responses|messages|llmapi> --baseurl <url> [--apikey|--apikey-stdin]
 llmapi add <name> --type lb --members <provider,provider>
 llmapi rm <name>
 llmapi set default <provider>
@@ -49,13 +49,24 @@ llmapi daemon start|stop|restart|status|uninstall|remove
 | OpenAI Responses   | `/responses`        | `/{provider}/responses`        |
 | Anthropic Messages | `/messages`         | `/{provider}/messages`         |
 
-当选中的 provider 使用 `openai-responses` 时，`/responses` 也接受 WebSocket 升级。
+当选中的 provider 使用 `openai-responses` 或 `llmapi` 时，`/responses` 也接受 WebSocket 升级。
 
 普通 provider 可配置 `models = ["gpt-5", "gpt-5-mini"]`，按区分大小写的模型 ID 限制生成请求。省略 `models` 或设置为空列表时不限制模型。直连 HTTP 请求使用未列出的模型时返回 `400`，WebSocket 请求违反限制时关闭连接，`check --model` 也遵守此限制。
 
 `GET /models` 和 `GET /v1/models`（也支持 `/{provider}` 前缀）接受上游 OpenAI `data` 或 Codex `models` 列表，并按所选 provider 的模型限制过滤。Codex 请求（通过 `client_version` 或 Codex User-Agent 识别）收到 `models`；其他客户端收到 OpenAI `data`。格式转换时会补齐缺失的元数据。
 
 `GET /providers` 返回当前默认 provider 和所有已配置 provider。每个已配置的 `apikey` 返回为 `***`；未设置的密钥会被省略。该端点不会展开环境变量，也不会联系上游 provider。
+
+## llmapi 中继
+
+```toml
+[providers.relay]
+upstream = "llmapi" # 也可以写成 type = "llmapi"
+baseurl = "https://remote.example.com/pool/v1"
+apikey = "${REMOTE_LLMAPI_API_KEY}"
+```
+
+中继保留客户端的生成协议，转发 Chat Completions、Responses、Messages、SSE 和模型列表，由远端 llmapi 选择上游并转换协议。`baseurl` 只写远端地址时使用其默认 provider，带 `/pool/v1` 时路由到远端的 `pool`。Responses WebSocket 需要远端选中的 provider 支持升级。`apikey` 填远端 llmapi 的服务端密钥。`check --model` 使用远端的 Chat Completions 入口。
 
 ## 负载均衡 provider
 
