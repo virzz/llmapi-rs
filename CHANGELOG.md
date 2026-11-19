@@ -4,6 +4,8 @@
 
 ## [未发布]
 
+## [v0.1.6]（2026-11-20）
+
 ### 新增
 
 - 支持 `upstream = "llmapi"` 或 `type = "llmapi"`，将 Chat Completions、Responses、Messages、SSE 和模型列表中继到远端 llmapi。Responses WebSocket 由支持升级的远端 provider 处理。
@@ -50,7 +52,8 @@
 - 按客户端协议返回模型目录，内置 DeepSeek 模型默认元数据。`GET /providers` 提供脱敏后的 provider 配置。
 - 支持通过 CLI 查看和管理 provider，并通过 macOS LaunchAgent 管理服务。
 
-[未发布]: https://github.com/virzz/llmapi-rs/compare/v0.1.5...main
+[未发布]: https://github.com/virzz/llmapi-rs/compare/v0.1.6...main
+[v0.1.6]: https://github.com/virzz/llmapi-rs/compare/v0.1.5...v0.1.6
 [v0.1.5]: https://github.com/virzz/llmapi-rs/compare/v0.1.4...v0.1.5
 [v0.1.4]: https://github.com/virzz/llmapi-rs/compare/v0.1.3...v0.1.4
 [v0.1.3]: https://github.com/virzz/llmapi-rs/compare/v0.1.2...v0.1.3
