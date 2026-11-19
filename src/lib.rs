@@ -50,10 +50,12 @@ enum Command {
         shell: Option<Shell>,
     },
     /// List configured providers
+    #[command(visible_aliases = ["ls", "l"])]
     List,
     /// Check that a provider is reachable
     Check(CheckArgs),
     /// Add a provider
+    #[clap(visible_alias = "a")]
     Add(AddArgs),
     /// Remove a provider
     #[command(visible_alias = "rm")]
@@ -998,10 +1000,12 @@ mod tests {
                 shell: Some(Shell::Fish)
             }
         ));
-        assert!(matches!(
-            Cmd::parse_from(["llmapi", "list"]).command,
-            Command::List
-        ));
+        for name in ["list", "ls", "l"] {
+            assert!(matches!(
+                Cmd::try_parse_from(["llmapi", name]).unwrap().command,
+                Command::List
+            ));
+        }
         assert!(matches!(
             Cmd::parse_from(["llmapi", "check"]).command,
             Command::Check(CheckArgs {
