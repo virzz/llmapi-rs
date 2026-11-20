@@ -4,8 +4,12 @@
 
 ## [未发布]
 
+## [v0.1.7]（2026-11-20）
+
 - Codex Responses 请求保留缓存选项和显式会话头。
+- 更新 DeepSeek 模型目录的最低客户端版本，从各模型条目加载指令模板。
 - `llmapi daemon` 使用 `daemon-rs` 管理 macOS launchd 和 Linux systemd 服务。Linux 通过 D-Bus 管理服务。普通用户管理用户服务，root 管理系统服务。
+- 项目切换至 Rust 2024 edition，并升级依赖。
 
 ## [v0.1.6]（2026-11-20）
 
@@ -55,7 +59,8 @@
 - 按客户端协议返回模型目录，内置 DeepSeek 模型默认元数据。`GET /providers` 提供脱敏后的 provider 配置。
 - 支持通过 CLI 查看和管理 provider，并通过 macOS LaunchAgent 管理服务。
 
-[未发布]: https://github.com/virzz/llmapi-rs/compare/v0.1.6...main
+[未发布]: https://github.com/virzz/llmapi-rs/compare/v0.1.7...main
+[v0.1.7]: https://github.com/virzz/llmapi-rs/compare/v0.1.6...v0.1.7
 [v0.1.6]: https://github.com/virzz/llmapi-rs/compare/v0.1.5...v0.1.6
 [v0.1.5]: https://github.com/virzz/llmapi-rs/compare/v0.1.4...v0.1.5
 [v0.1.4]: https://github.com/virzz/llmapi-rs/compare/v0.1.3...v0.1.4
