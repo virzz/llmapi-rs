@@ -6,7 +6,7 @@ pub mod adapters;
 pub mod auth;
 mod codex;
 pub mod config;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub mod daemon;
 pub mod lb;
 pub mod model;
@@ -66,8 +66,8 @@ enum Command {
     Set(SetArgs),
     /// Start the HTTP server
     Server(ServerArgs),
-    /// Manage the macOS LaunchAgent
-    #[cfg(target_os = "macos")]
+    /// Manage the service (launchd on macOS, systemd on Linux)
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     Daemon(daemon::DaemonArgs),
 }
 
@@ -460,7 +460,7 @@ impl Cmd {
             Command::Remove(args) => self.remove(args),
             Command::Set(args) => self.set(args),
             Command::Server(args) => self.serve(args).await,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
             Command::Daemon(args) => args.execute(),
         }
     }

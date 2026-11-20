@@ -4,6 +4,8 @@
 
 ## [未发布]
 
+- `llmapi daemon` 使用 `daemon-rs` 管理 macOS launchd 和 Linux systemd 服务。Linux 通过 D-Bus 管理服务。普通用户管理用户服务，root 管理系统服务。
+
 ## [v0.1.6]（2026-11-20）
 
 ### 新增

@@ -77,16 +77,34 @@ default selects the first remaining provider by name. The last provider can
 also be removed, unless an `lb` provider references it. Saved provider keys
 remain in the config file as plaintext.
 
-On macOS, `daemon install` writes a user LaunchAgent to
-`~/Library/LaunchAgents/com.virzz.enyo.llmapi.plist`. The default working
-directory is the current directory and the default argument is `server`.
-`--args` replaces the full argument list. Logs go to
-`~/Library/Logs/com.virzz.enyo.llmapi/`. Installation and removal only change
-files; use `daemon start` or `daemon stop` to change launchctl state. `remove`
-is an alias for `uninstall`; neither command deletes logs.
-`daemon restart` unloads and bootstraps the service to apply an updated plist.
-`daemon status` reports `not loaded` or `not installed` when launchctl has no
-matching service; other launchctl errors remain errors.
+On macOS and Linux, `daemon` uses `daemon-rs` as its backend. The working
+directory defaults to the current directory and the argument list defaults to
+`server`. Use `--args` to replace the full argument list. `daemon uninstall`
+stops the service before removing its definition, and `remove` is its alias.
+
+On macOS, the user LaunchAgent is installed at
+`~/Library/LaunchAgents/com.virzz.enyo.llmapi.plist` and logs to
+`~/Library/Logs/com.virzz.enyo.llmapi/`. When invoked as root, the command
+manages `/Library/LaunchDaemons/com.virzz.enyo.llmapi.plist` and logs to
+`/Library/Logs/com.virzz.enyo.llmapi/`. Use `daemon restart` to apply an updated
+plist and restart the service.
+
+On Linux, `daemon` manages systemd over D-Bus. The user unit is installed at
+`${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/llmapi.service` and starts with
+the user's systemd session. When invoked as root, the command manages
+`/etc/systemd/system/llmapi.service`, which starts at boot. Use `daemon start`
+to start it immediately after installation.
+
+```bash
+llmapi daemon install --workdir "$PWD" --args server --config llmapi.toml
+llmapi daemon start
+llmapi daemon status
+journalctl --user -u llmapi.service -f
+```
+
+`daemon restart` reloads the unit and restarts the service. Uninstalling also
+disables the service. systemd reads an optional `llmapi.env` in the working
+directory, which can supply environment variables referenced by the configuration.
 
 Configuration is loaded from `--config <path>` when specified; otherwise from
 `./config.{toml,yaml,yml,json}` in that order, then

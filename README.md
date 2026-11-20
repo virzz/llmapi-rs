@@ -54,11 +54,20 @@ llmapi daemon start|stop|restart|status|uninstall|remove
 `printf '%s\n' "$API_KEY" | llmapi add <name> --type chat --baseurl <url> --apikey-stdin`。
 `add` 拒绝空密钥和明文密钥参数。省略两个参数时不设置上游密钥。`remove`（别名 `rm`）删除 provider；删除默认 provider 后按名称选择剩余的第一个 provider。最后一个 provider 也可以删除，但被 `lb` 组引用的 provider 必须先从组中移除。保存的 provider 密钥以明文保留在配置文件中。
 
-在 macOS 上，`daemon install` 将用户 LaunchAgent 写入
-`~/Library/LaunchAgents/com.virzz.enyo.llmapi.plist`。默认工作目录是当前目录，默认参数是 `server`。`--args` 会替换完整参数列表。日志写入
-`~/Library/Logs/com.virzz.enyo.llmapi/`。安装和删除只修改文件；使用 `daemon start` 或 `daemon stop` 改变 launchctl 状态。`remove` 是 `uninstall` 的别名；两者都不会删除日志。
-`daemon restart` 卸载并重新引导服务，以应用更新后的 plist。
-当 launchctl 没有匹配的服务时，`daemon status` 报告 `not loaded` 或 `not installed`；其他 launchctl 错误仍按错误处理。
+macOS 和 Linux 的 `daemon` 命令由 `daemon-rs` 提供后端。默认工作目录是当前目录，默认参数是 `server`。`--args` 会替换完整参数列表。`daemon uninstall` 会先停止服务，再移除服务定义，`remove` 是它的别名。
+
+在 macOS 上，普通用户安装的 LaunchAgent 位于 `~/Library/LaunchAgents/com.virzz.enyo.llmapi.plist`，日志写入 `~/Library/Logs/com.virzz.enyo.llmapi/`。以 root 运行时，命令管理 `/Library/LaunchDaemons/com.virzz.enyo.llmapi.plist`，日志写入 `/Library/Logs/com.virzz.enyo.llmapi/`。`daemon restart` 重新加载 plist 并重启服务。
+
+在 Linux 上，`daemon` 通过 D-Bus 管理 systemd。普通用户安装的 unit 位于 `${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/llmapi.service`，随用户的 systemd 会话启动。以 root 运行时，命令管理 `/etc/systemd/system/llmapi.service`，服务随系统启动。安装后用 `daemon start` 立即启动。
+
+```bash
+llmapi daemon install --workdir "$PWD" --args server --config llmapi.toml
+llmapi daemon start
+llmapi daemon status
+journalctl --user -u llmapi.service -f
+```
+
+`daemon restart` 重新加载 unit 并重启服务。卸载时还会禁用服务。systemd 会读取工作目录中的可选 `llmapi.env`，可用它为配置提供环境变量。
 
 配置按以下顺序加载：指定 `--config <path>` 时使用该文件；否则依次查找
 `./config.{toml,yaml,yml,json}`，再依次查找
