@@ -764,13 +764,16 @@ fn plan_generate(
 
     let mut derived_headers = HeaderMap::new();
     if is_codex {
-        // Derive session headers before serialization; image/tool inputs can be large.
+        // Use the cache key as a fallback for clients that omit session headers.
         if let Some(key) = upstream_json["prompt_cache_key"]
             .as_str()
             .and_then(|key| HeaderValue::from_str(key).ok())
         {
-            derived_headers.insert("session-id", key.clone());
-            derived_headers.insert("thread-id", key);
+            for name in ["session-id", "thread-id"] {
+                if !client_headers.contains_key(name) {
+                    derived_headers.insert(name, key.clone());
+                }
+            }
         }
     }
     let mode = if upstream_raw {

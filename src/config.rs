@@ -17,6 +17,8 @@ pub struct Config {
     pub server: String,
     #[serde(default, skip_serializing_if = "is_false")]
     pub access_log: bool,
+    #[serde(default, skip_serializing_if = "Injects::is_default")]
+    pub injects: Injects,
     #[serde(
         default,
         rename = "apikey",
@@ -28,6 +30,19 @@ pub struct Config {
     pub default: String,
     #[serde(default)]
     pub providers: BTreeMap<String, ProviderConfig>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Injects {
+    /// Inject a provider when local Codex ChatGPT credentials are available.
+    pub codex: bool,
+}
+
+impl Injects {
+    fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
 }
 
 /// A configured provider: either a real upstream or a load-balancer group.
@@ -110,6 +125,10 @@ pub enum ConfigError {
     UnknownProviderType(String),
     #[error("provider not found: {0}")]
     ProviderNotFound(String),
+    #[error(
+        "Codex provider is unavailable: enable injects.codex or configure a provider named codex"
+    )]
+    CodexInjectionDisabled,
     #[error("provider already exists: {0}")]
     ProviderAlreadyExists(String),
     #[error("default provider is not configured: {0}")]
@@ -143,6 +162,7 @@ impl Default for Config {
         Self {
             server: default_server(),
             access_log: false,
+            injects: Injects::default(),
             api_key: None,
             default: String::new(),
             providers: BTreeMap::new(),
@@ -226,8 +246,13 @@ impl Config {
     }
 
     pub fn set_default(&mut self, name: &str) -> Result<(), ConfigError> {
-        if name != "codex" && !self.providers.contains_key(name) {
-            return Err(ConfigError::ProviderNotFound(name.to_string()));
+        if !self.providers.contains_key(name) {
+            if name != "codex" {
+                return Err(ConfigError::ProviderNotFound(name.to_string()));
+            }
+            if !self.injects.codex {
+                return Err(ConfigError::CodexInjectionDisabled);
+            }
         }
         self.default = name.to_string();
         Ok(())
@@ -268,7 +293,7 @@ impl Config {
     }
 
     pub(crate) fn with_codex(mut self, available: bool) -> Self {
-        if available {
+        if self.injects.codex && available {
             self.providers.entry("codex".into()).or_insert_with(|| {
                 ProviderConfig::upstream(Protocol::Codex, crate::codex::BASE_URL, None)
             });
@@ -752,8 +777,31 @@ providers:
     }
 
     #[test]
+    fn codex_injection_requires_explicit_opt_in() {
+        for body in ["", "injects = {}", "injects = { codex = false }"] {
+            let disabled = Config::parse(Path::new("config.toml"), body).unwrap();
+            assert!(!disabled.injects.codex);
+            assert_eq!(disabled.clone().with_codex(true), disabled);
+        }
+
+        let enabled = Config::parse(Path::new("config.yaml"), "injects: {codex: true}").unwrap();
+        assert!(enabled.injects.codex);
+        assert_eq!(enabled.clone().with_codex(true).default, "codex");
+        let serialized = toml::to_string(&enabled).unwrap();
+        let loaded = Config::parse(Path::new("config.toml"), &serialized).unwrap();
+        assert_eq!(loaded, enabled);
+
+        let mut manual = Config::parse(Path::new("config.yaml"), CONFIG_YAML).unwrap();
+        let provider = manual.providers["openai"].clone();
+        manual.providers.insert("codex".into(), provider.clone());
+        manual.set_default("codex").unwrap();
+        assert_eq!(manual.with_codex(true).provider(None).unwrap().1, &provider);
+    }
+
+    #[test]
     fn automatic_codex_preserves_configured_providers_and_default() {
-        let config = Config::parse(Path::new("config.yaml"), CONFIG_YAML).unwrap();
+        let mut config = Config::parse(Path::new("config.yaml"), CONFIG_YAML).unwrap();
+        config.injects.codex = true;
         let effective = config.clone().with_codex(true);
         assert_eq!(effective.default, "deepseek");
         assert_eq!(
@@ -766,7 +814,6 @@ providers:
         let manual = collision.providers["openai"].clone();
         collision.providers.insert("codex".into(), manual.clone());
         assert_eq!(collision.with_codex(true).providers["codex"], manual);
-        assert_eq!(Config::default().with_codex(true).default, "codex");
     }
 
     #[test]
@@ -774,6 +821,7 @@ providers:
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.yaml");
         let mut config = Config::default();
+        config.injects.codex = true;
         config.set_default("codex").unwrap();
         config.save(&path).unwrap();
         let saved = Config::load(path).unwrap();
@@ -1020,19 +1068,21 @@ providers:
     #[test]
     fn single_member_lb_and_automatic_codex_member_are_valid() {
         let body = "default: pool\nproviders:\n  primary:\n    type: chat\n    baseurl: https://a.test\n  pool:\n    type: lb\n    members: [primary]\n  solo:\n    type: lb\n    members: [codex]\n";
-        let config = Config::parse(Path::new("llmapi.yaml"), body).unwrap();
+        let mut config = Config::parse(Path::new("llmapi.yaml"), body).unwrap();
+        config.injects.codex = true;
         assert_eq!(
             config.providers["pool"].as_lb().unwrap().members,
             ["primary"]
         );
         assert_eq!(config.providers["solo"].as_lb().unwrap().members, ["codex"]);
-        assert!(config.with_codex(true).provider(Some("solo")).is_ok());
+        assert!(config.with_codex(true).provider(Some("codex")).is_ok());
     }
 
     #[test]
     fn configured_codex_provider_takes_priority_over_automatic_one() {
         let body = "default: pool\nproviders:\n  codex:\n    type: chat\n    baseurl: https://codex.test\n  pool:\n    type: lb\n    members: [codex]\n";
-        let config = Config::parse(Path::new("llmapi.yaml"), body).unwrap();
+        let mut config = Config::parse(Path::new("llmapi.yaml"), body).unwrap();
+        config.injects.codex = true;
         let effective = config.with_codex(true);
         assert_eq!(
             effective.providers["codex"].protocol(),

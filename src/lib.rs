@@ -185,7 +185,9 @@ impl Cmd {
     }
 
     fn list(&self) -> Result<()> {
-        let config = self.load_config()?.with_codex(codex::available());
+        let config = self.load_config()?;
+        let available = config.injects.codex && codex::available();
+        let config = config.with_codex(available);
         print!("{}", format_provider_list(&config));
         Ok(())
     }
@@ -200,9 +202,13 @@ impl Cmd {
         args: &CheckArgs,
         lb_header_timeout: Duration,
     ) -> Result<()> {
-        let codex_headers =
-            codex::auth_path().and_then(|path| codex::read_auth(&path).ok().flatten());
-        let config = self.load_config()?.with_codex(codex_headers.is_some());
+        let config = self.load_config()?;
+        let codex_headers = if config.injects.codex {
+            codex::auth_path().and_then(|path| codex::read_auth(&path).ok().flatten())
+        } else {
+            None
+        };
+        let config = config.with_codex(codex_headers.is_some());
         if config.providers.is_empty() {
             bail!("no providers configured");
         }
@@ -1225,6 +1231,7 @@ mod tests {
         let config = Config {
             server: "127.0.0.1:8080".into(),
             access_log: false,
+            injects: Default::default(),
             api_key: None,
             default: "deepseek".into(),
             providers: BTreeMap::from([(
@@ -1270,6 +1277,7 @@ mod tests {
         let mut config = Config {
             server: "127.0.0.1:8080".into(),
             access_log: false,
+            injects: Default::default(),
             api_key: None,
             default: "deepseek".into(),
             providers: BTreeMap::from([
@@ -1300,7 +1308,7 @@ mod tests {
     }
 
     #[test]
-    fn set_rejects_unknown_provider_without_rewriting_file() {
+    fn set_rejects_unavailable_provider_without_rewriting_file() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("llmapi.yaml");
         fs::write(
@@ -1309,20 +1317,24 @@ mod tests {
         )
         .unwrap();
         let before = fs::read_to_string(&path).unwrap();
-        let cmd = Cmd::parse_from([
-            "llmapi",
-            "-c",
-            path.to_str().unwrap(),
-            "set",
-            "default",
-            "missing",
-        ]);
-        let Command::Set(args) = &cmd.command else {
-            unreachable!()
-        };
-
-        assert!(cmd.set(args).is_err());
-        assert_eq!(fs::read_to_string(path).unwrap(), before);
+        for (provider, error_hint) in [
+            ("missing", "provider not found"),
+            ("codex", "injects.codex"),
+        ] {
+            let cmd = Cmd::parse_from([
+                "llmapi",
+                "-c",
+                path.to_str().unwrap(),
+                "set",
+                "default",
+                provider,
+            ]);
+            let Command::Set(args) = &cmd.command else {
+                unreachable!()
+            };
+            assert!(cmd.set(args).unwrap_err().to_string().contains(error_hint));
+            assert_eq!(fs::read_to_string(&path).unwrap(), before);
+        }
     }
 
     #[tokio::test]

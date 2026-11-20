@@ -125,23 +125,8 @@ fn to_codex_model(value: &Value) -> Result<Value, &'static str> {
 fn deepseek_defaults(id: &str) -> Option<&'static Map<String, Value>> {
     static CATALOG: OnceLock<Value> = OnceLock::new();
     let catalog = CATALOG.get_or_init(|| {
-        let mut catalog: Value = serde_json::from_str(include_str!("deepseek_defaults.json"))
-            .expect("bundled DeepSeek model defaults must be valid JSON");
-        let instructions = catalog["instructions_template"]
-            .as_str()
-            .expect("bundled DeepSeek instructions must be a string")
-            .to_owned();
-        for model in catalog["models"]
-            .as_array_mut()
-            .expect("bundled DeepSeek models must be an array")
-        {
-            let model = model
-                .as_object_mut()
-                .expect("bundled DeepSeek model must be an object");
-            model.insert("base_instructions".into(), json!(instructions));
-            model["model_messages"]["instructions_template"] = json!(instructions);
-        }
-        catalog
+        serde_json::from_str(include_str!("deepseek_defaults.json"))
+            .expect("bundled DeepSeek model defaults must be valid JSON")
     });
     catalog
         .get("models")?

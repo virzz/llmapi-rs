@@ -1188,7 +1188,8 @@ async fn lb_models_skip_conditional_requests_and_member_etags() {
 #[tokio::test]
 async fn lb_skips_codex_when_credentials_are_unavailable() {
     let (good, good_calls) = models_member("good").await;
-    let config = config_with(&["codex", "good"], &[("good", &good, Protocol::OpenAiChat)]);
+    let mut config = config_with(&["codex", "good"], &[("good", &good, Protocol::OpenAiChat)]);
+    config.injects.codex = true;
     let proxy = start_proxy(config).await;
 
     let response = reqwest::get(format!("http://{proxy}/models"))
@@ -1247,6 +1248,7 @@ async fn lb_switches_away_from_codex_401_while_direct_codex_does_not() {
         json_member(StatusCode::UNAUTHORIZED, json!({"error": "expired"})).await;
     let (good, good_calls) = models_member("good").await;
     let mut config = config_with(&["codex", "good"], &[("good", &good, Protocol::OpenAiChat)]);
+    config.injects.codex = true;
     config.providers.insert(
         "codex".into(),
         ProviderConfig::upstream(Protocol::Codex, codex, None),
@@ -1676,13 +1678,14 @@ async fn oversized_request_body_is_rejected_before_any_member_attempt() {
 async fn codex_credential_refresh_does_not_reset_lb_cursors() {
     let (a, _) = models_member("a").await;
     let (b, _) = models_member("b").await;
-    let config = config_with(
+    let mut config = config_with(
         &["a", "b"],
         &[
             ("a", &a, Protocol::OpenAiChat),
             ("b", &b, Protocol::OpenAiChat),
         ],
     );
+    config.injects.codex = true;
     let (auth, auth_receiver) = watch::channel(None);
     let proxy = start_proxy_with_auth(config, auth_receiver).await;
 

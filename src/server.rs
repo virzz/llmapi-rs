@@ -21,7 +21,7 @@ use tracing::{info, warn};
 
 use super::{
     auth, codex,
-    config::{Config, ProviderConfig},
+    config::{Config, ConfigError, ProviderConfig},
     lb, proxy, redact,
 };
 
@@ -77,8 +77,12 @@ struct ServerState {
 
 impl ServerState {
     fn snapshot(&self) -> AppState {
-        let codex_headers = self.codex_auth.borrow().clone();
         let runtime = self.runtime.borrow().clone();
+        let codex_headers = if runtime.config.injects.codex {
+            self.codex_auth.borrow().clone()
+        } else {
+            None
+        };
         let config = if codex_headers.is_some() {
             Arc::new(runtime.config.as_ref().clone().with_codex(true))
         } else {
@@ -96,12 +100,13 @@ impl ServerState {
 }
 
 pub fn app(config: Config) -> Router {
+    let auth_path = if config.injects.codex {
+        codex::auth_path()
+    } else {
+        None
+    };
     let (_, runtime) = watch::channel(Arc::new(Runtime::new(config)));
-    app_with_config(runtime)
-}
-
-fn app_with_config(runtime: watch::Receiver<Arc<Runtime>>) -> Router {
-    app_with_auth(runtime, codex::watch_auth(codex::auth_path()))
+    app_with_auth(runtime, codex::watch_auth(auth_path))
 }
 
 fn app_with_auth(
@@ -250,7 +255,7 @@ pub(crate) async fn serve_reloading(
     );
     tokio::pin!(watcher);
     let (mut shutdown, shutdown_receiver) = oneshot::channel();
-    let codex_auth = codex::watch_auth(codex::auth_path());
+    let codex_auth = watch_reloading_codex_auth(receiver.clone(), codex::auth_path());
     let mut server = Box::pin(run_server(
         listener,
         receiver.clone(),
@@ -332,6 +337,37 @@ async fn run_server(
     Ok(())
 }
 
+fn watch_reloading_codex_auth(
+    mut runtime: watch::Receiver<Arc<Runtime>>,
+    path: Option<PathBuf>,
+) -> watch::Receiver<Option<HeaderMap>> {
+    let mut enabled = runtime.borrow_and_update().config.injects.codex;
+    let mut auth = codex::watch_auth(path.clone().filter(|_| enabled));
+    let (sender, receiver) = watch::channel(auth.borrow_and_update().clone());
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = sender.closed() => return,
+                changed = runtime.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                    let next = runtime.borrow_and_update().config.injects.codex;
+                    if enabled != next {
+                        enabled = next;
+                        auth = codex::watch_auth(path.clone().filter(|_| enabled));
+                        sender.send_replace(auth.borrow_and_update().clone());
+                    }
+                }
+                Ok(()) = auth.changed() => {
+                    sender.send_replace(auth.borrow_and_update().clone());
+                }
+            }
+        }
+    });
+    receiver
+}
+
 async fn watch_config(
     path: PathBuf,
     listen_address: String,
@@ -365,7 +401,10 @@ async fn watch_config(
         }
         let config = Config::parse(&path, &body).and_then(|mut config| {
             if let Some(default) = &default_override {
-                config.set_default(default)?;
+                match config.set_default(default) {
+                    Err(ConfigError::CodexInjectionDisabled) => {}
+                    result => result?,
+                }
             }
             if server_override {
                 config.server = listen_address.clone();
@@ -608,6 +647,7 @@ mod tests {
         Config {
             server: "127.0.0.1:0".into(),
             access_log: false,
+            injects: Default::default(),
             api_key: None,
             default: "deepseek".into(),
             providers: BTreeMap::from([

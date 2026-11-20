@@ -4,6 +4,7 @@
 
 ## [未发布]
 
+- Codex Responses 请求保留缓存选项和显式会话头。
 - `llmapi daemon` 使用 `daemon-rs` 管理 macOS launchd 和 Linux systemd 服务。Linux 通过 D-Bus 管理服务。普通用户管理用户服务，root 管理系统服务。
 
 ## [v0.1.6]（2026-11-20）
@@ -29,7 +30,7 @@
 
 ## [v0.1.4]（2026-10-28）
 
-- 自动发现本地 Codex ChatGPT 登录，并提供 `/codex` 路由和模型目录。
+- 支持 Codex 格式的模型目录。
 - 补齐 DeepSeek 模型的默认指令模板。
 
 ## [v0.1.3]（2026-09-24）

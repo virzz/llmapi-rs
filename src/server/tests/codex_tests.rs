@@ -1,7 +1,22 @@
 use super::*;
+use crate::config::Injects;
+
+fn inject_codex_config() -> Config {
+    Config {
+        injects: Injects { codex: true },
+        ..Config::default()
+    }
+}
 
 async fn start_codex_proxy(config: Config, auth: watch::Receiver<Option<HeaderMap>>) -> SocketAddr {
     let (_, config) = watch::channel(Arc::new(Runtime::new(config)));
+    start_codex_proxy_with_runtime(config, auth).await
+}
+
+async fn start_codex_proxy_with_runtime(
+    config: watch::Receiver<Arc<Runtime>>,
+    auth: watch::Receiver<Option<HeaderMap>>,
+) -> SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -26,7 +41,7 @@ fn credentials() -> HeaderMap {
 }
 
 fn codex_config(upstream: String) -> Config {
-    let mut config = Config::default().with_codex(true);
+    let mut config = inject_codex_config().with_codex(true);
     config
         .providers
         .get_mut("codex")
@@ -46,7 +61,7 @@ fn completed_response() -> Value {
 #[tokio::test]
 async fn automatic_provider_follows_auth_and_never_exposes_credentials() {
     let (sender, receiver) = watch::channel(None);
-    let address = start_codex_proxy(Config::default(), receiver).await;
+    let address = start_codex_proxy(inject_codex_config(), receiver).await;
     let url = format!("http://{address}/providers");
     let value: Value = reqwest::get(&url).await.unwrap().json().await.unwrap();
     assert_eq!(value["providers"], json!({}));
@@ -64,6 +79,80 @@ async fn automatic_provider_follows_auth_and_never_exposes_credentials() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn config_reload_controls_codex_injection_with_available_auth() {
+    let (config, runtime) = watch::channel(Arc::new(Runtime::new(Config::default())));
+    let (_, auth) = watch::channel(Some(credentials()));
+    let address = start_codex_proxy_with_runtime(runtime, auth).await;
+    let url = format!("http://{address}/providers");
+
+    for codex in [false, true, false, true] {
+        config.send_replace(Arc::new(Runtime::new(Config {
+            injects: Injects { codex },
+            ..Config::default()
+        })));
+        let value: Value = reqwest::get(&url).await.unwrap().json().await.unwrap();
+        assert_eq!(value["providers"].get("codex").is_some(), codex);
+        assert_eq!(value["default"], if codex { "codex" } else { "" });
+    }
+}
+
+#[tokio::test]
+async fn reloading_stops_and_restarts_codex_auth_with_the_injection_flag() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("config.toml");
+    let auth_path = directory.path().join("auth.json");
+    let write_auth = |token: &str| {
+        fs::write(
+            &auth_path,
+            json!({"auth_mode": "chatgpt", "tokens": {"access_token": token}}).to_string(),
+        )
+        .unwrap();
+    };
+    write_auth("first");
+    let mut file_config = test_config("https://example.test");
+    file_config.injects.codex = true;
+    save_config_atomically(&file_config, &path);
+    let mut active = file_config.clone();
+    active.set_default("codex").unwrap();
+    let (sender, runtime) = watch::channel(Arc::new(Runtime::new(active)));
+    let mut auth = watch_reloading_codex_auth(runtime.clone(), Some(auth_path.clone()));
+    let watcher = tokio::spawn(watch_config(
+        path.clone(),
+        String::new(),
+        false,
+        Some("codex".into()),
+        sender,
+    ));
+    assert_eq!(
+        auth.borrow().as_ref().unwrap()["authorization"],
+        "Bearer first"
+    );
+
+    file_config.injects.codex = false;
+    save_config_atomically(&file_config, &path);
+    tokio::time::timeout(Duration::from_secs(3), auth.wait_for(Option::is_none))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!runtime.borrow().config.injects.codex);
+    assert_eq!(runtime.borrow().config.default, "deepseek");
+
+    write_auth("second");
+    file_config.injects.codex = true;
+    save_config_atomically(&file_config, &path);
+    let credentials = tokio::time::timeout(Duration::from_secs(3), auth.wait_for(Option::is_some))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        credentials.as_ref().unwrap()["authorization"],
+        "Bearer second"
+    );
+    assert_eq!(runtime.borrow().config.default, "codex");
+    watcher.abort();
 }
 
 #[tokio::test]
@@ -125,6 +214,38 @@ async fn codex_aggregates_sse_for_all_nonstreaming_protocols() {
         assert_eq!(request.body["store"], false);
         assert!(request.body.get("max_output_tokens").is_none());
     }
+}
+
+#[tokio::test]
+async fn codex_preserves_cache_options_and_explicit_session_headers() {
+    let event = format!(
+        "data: {}\n\n",
+        json!({"type": "response.completed", "response": completed_response()})
+    );
+    let (upstream, captured) = start_stream_upstream(vec![event.into_bytes()]).await;
+    let (_, auth) = watch::channel(Some(credentials()));
+    let address = start_codex_proxy(codex_config(upstream), auth).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{address}/codex/responses"))
+        .header("session-id", "session-1")
+        .header("thread-id", "thread-1")
+        .json(&json!({
+            "model": "gpt-5",
+            "input": "hi",
+            "prompt_cache_key": "cache-1",
+            "prompt_cache_options": {"ttl": "12h"}
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let request = captured.lock().await.clone().unwrap();
+    assert_eq!(request.body["prompt_cache_key"], "cache-1");
+    assert_eq!(request.body["prompt_cache_options"], json!({"ttl": "12h"}));
+    assert_eq!(request.headers["session-id"], "session-1");
+    assert_eq!(request.headers["thread-id"], "thread-1");
 }
 
 #[tokio::test]

@@ -46,7 +46,7 @@ llmapi daemon install [--workdir <path>] [--args server ...]
 llmapi daemon start|stop|restart|status|uninstall|remove
 ```
 
-`check` 在不启动服务的情况下探测 provider。使用参数指定的 provider；省略参数时使用配置的默认 provider。不带 `--model` 时请求 `GET /models` 并报告模型数量；带 `--model` 时改为发送一个最小补全请求。命令会输出 provider、状态、延迟和简短响应摘要，并在传输错误或非 2xx 响应时以非零状态退出。`--timeout` 默认 30 秒，是本次命令的总时间预算。对负载均衡 provider，`check` 从首成员开始按配置顺序探测，输出最终响应的成员和尝试次数，并使用与请求路由相同的失败分类。Codex 检查使用本地 Codex 登录。
+`check` 在不启动服务的情况下探测 provider。使用参数指定的 provider；省略参数时使用配置的默认 provider。不带 `--model` 时请求 `GET /models` 并报告模型数量；带 `--model` 时改为发送一个最小补全请求。命令会输出 provider、状态、延迟和简短响应摘要，并在传输错误或非 2xx 响应时以非零状态退出。`--timeout` 默认 30 秒，是本次命令的总时间预算。对负载均衡 provider，`check` 从首成员开始按配置顺序探测，输出最终响应的成员和尝试次数，并使用与请求路由相同的失败分类。
 
 `completion` 将 shell 补全脚本写入 stdout。未指定 shell 参数时使用检测到的当前 shell，否则使用 Bash。
 
@@ -75,7 +75,7 @@ journalctl --user -u llmapi.service -f
 `~/.config/enyo/llmapi.yaml`。显式选择的文件不会回退；`add` 可以在该路径创建新文件。`server` 命令的 `--server` 和 `--default` 参数会覆盖所选文件中的监听地址和默认 provider，但不修改文件。
 设置顶层 `apikey`（例如 `apikey: ${LLMAPI_API_KEY}`）后，所有 HTTP 路由都要求客户端密钥。客户端可以通过 `Authorization: Bearer <key>`、`x-api-key`、`api-key` 或 `key` 查询参数发送密钥。缺失或错误的密钥返回 401。未设置顶层 `apikey` 时服务器保持开放；provider 的 `apikey` 仍是独立的上游凭据。
 设置顶层 `access_log = true`（YAML：`access_log: true`）后，每个 HTTP 请求都会向 stdout 写入一行访问日志，包含客户端地址、方法、脱敏后的路径、响应状态和处理耗时。所有请求都会记录，包括被拒绝的请求；默认关闭。服务器重新加载配置文件后，该设置对新请求生效。
-服务运行期间，每 500 ms 检查一次所选配置文件，并将有效的 provider/默认 provider 变更应用到新请求。修改 `server` 时先绑定新监听器，再关闭旧监听器；绑定失败时保留旧监听器并重试。CLI 覆盖始终有效。无效或缺失的文件保留最后一次有效配置；修改所选配置路径需要重启。
+服务运行期间，每 500 ms 检查一次所选配置文件，并将有效的 provider/默认 provider 变更应用到新请求。修改 `server` 时先绑定新监听器，再关闭旧监听器；绑定失败时保留旧监听器并重试。无效或缺失的文件保留最后一次有效配置；修改所选配置路径需要重启。
 
 ## HTTP 路由
 
@@ -134,7 +134,7 @@ llmapi set default pool
 llmapi list
 ```
 
-`lb` provider 不接受 `baseurl`、`apikey` 或 `models`；`members` 必须是非空、有序且不重复的成员列表。成员必须是现有普通 provider：未知名称、自引用和嵌套 `lb` 都会被拒绝。未配置但自动发现的 `codex` 可以作为成员，运行时凭据不可用则跳过；同名普通 provider 优先。被 `lb` 引用的 provider 在组被修改或删除前不能删除；删除 `lb` 本身不会删除成员。
+`lb` provider 不接受 `baseurl`、`apikey` 或 `models`；`members` 必须是非空、有序且不重复的成员列表。成员必须是现有普通 provider：未知名称、自引用和嵌套 `lb` 都会被拒绝。被 `lb` 引用的 provider 在组被修改或删除前不能删除；删除 `lb` 本身不会删除成员。
 
 故障切换只作用于通过 `lb` 发起的请求：
 
@@ -154,34 +154,11 @@ llmapi list
 
 `GET /models`（也支持 `/v1` 和 `/{provider}`）与生成请求共享轮询游标，只返回选定成员的目录，不合并多个目录。只有直连且未配置模型限制的 provider 才会转发 `If-None-Match` 并保留原有的 `ETag` 行为。依赖上游会话状态的请求（`previous_response_id`、`conversation`）应使用具体 provider 路由，因为 `lb` 可能在请求之间切换成员。模型名不做映射。
 
-每个生效配置版本原子发布自己的配置和游标。有效配置变更会从零开始新游标，在途请求继续使用旧版本；无效热加载保留上一版本。访问具体 provider 的请求不消耗 `lb` 游标，Codex 凭据轮询不会重置游标。
+每个生效配置版本原子发布自己的配置和游标。有效配置变更会从零开始新游标，在途请求继续使用旧版本；无效热加载保留上一版本。访问具体 provider 的请求不消耗 `lb` 游标。
 
 `lb` 组不支持 WebSocket；升级请求会在连接上游前收到 HTTP 400。首版不提供后台健康检查、熔断冷却、嵌套组、权重、会话粘性或跨进程游标协调。
 
 限制与错误行为详见上述表格；provider 配置格式见 [examples/config.yaml](examples/config.yaml)。
-
-## Codex ChatGPT provider
-
-当 `auth_mode` 为 `chatgpt` 且存在 `tokens.access_token` 时，`llmapi` 会自动发现
-`~/.codex/auth.json`。无需 provider 条目或 API 密钥。服务启动时读取该文件，此后每 **5 分钟**读取一次，包括文件尚不存在的情况。凭据缺失、不可读、无效或不是 ChatGPT 登录时，会在下一次轮询时停用自动 provider。
-
-```bash
-llmapi server
-# 或者不添加 provider 条目，直接将 Codex 设为默认：
-llmapi set default codex
-```
-
-使用 `/codex/responses`、`/codex/chat/completions`、`/codex/messages` 和
-`/codex/models`（也支持 `/codex` 后加 `/v1`）。自动 provider 会出现在
-`llmapi list` 和 `GET /providers` 中。已配置的 provider 及其默认 provider 保持有效；名为 `codex` 的已配置 provider 优先。没有配置文件和 provider 时，Codex 在可用时成为运行时默认 provider。显式选择的配置文件缺失时仍返回错误。
-
-代理使用本地访问令牌和账户 ID 访问
-`https://chatgpt.com/backend-api/codex`。它**不会刷新令牌，也不会写入
-auth.json**。请继续由 Codex 管理登录；更新最多需要五分钟才能到达 llmapi。直连 Codex provider 时，上游 401 会直接返回。凭据不会写入 llmapi 配置，也不会通过 provider 列表暴露。仅使用 `~/.codex/auth.json`；不会发现仅存在于 Keychain 的登录。
-
-支持流式和非流式 HTTP 请求。后端始终使用 `store=false` 的 Responses SSE；非流式客户端会收到最终 JSON 响应。原生 Responses 流会保留上游事件。该 provider 不支持 WebSocket 请求。
-
-Codex 请求会省略不受支持的采样/输出限制字段（`temperature`、`top_p`、`stop`、`max_output_tokens` 和 `max_completion_tokens`），包括从 Chat 或 Messages 转换而来的输出限制。这些设置对后端没有作用。`user`、`safety_identifier` 和 `prompt_cache_options` 也会被省略；仅转发 `priority` 和 `ultrafast` 服务层级。存储的会话引用（`previous_response_id`、`conversation` 和输入 `item_reference`）会被拒绝；请发送完整历史。模型访问权限和使用限制取决于 ChatGPT 账户。
 
 ## 开发
 
