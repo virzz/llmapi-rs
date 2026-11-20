@@ -1,5 +1,7 @@
 //! @about: LLM API protocol conversion proxy
 
+#![forbid(unsafe_code)]
+
 pub mod adapters;
 pub mod auth;
 mod codex;
