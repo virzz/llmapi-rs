@@ -126,17 +126,17 @@ fn is_http_scheme(scheme: &str) -> bool {
 fn unparsed_authority(url: &str) -> (Option<&str>, &str) {
     // HTTP-like schemes tolerate nonstandard slash counts (`https:/host`);
     // this mirrors how the URL parser would handle the request target.
-    if let Some((scheme, after)) = url.split_once(':') {
-        if is_http_scheme(scheme) {
-            return (Some(scheme), after.trim_start_matches(['/', '\\']));
-        }
+    if let Some((scheme, after)) = url.split_once(':')
+        && is_http_scheme(scheme)
+    {
+        return (Some(scheme), after.trim_start_matches(['/', '\\']));
     }
     // Other `scheme://authority` forms are not requested by the proxy, but a
     // configured URL must still not display embedded credentials.
-    if let Some((scheme, after)) = url.split_once("://") {
-        if is_valid_scheme(scheme) {
-            return (Some(scheme), after.trim_start_matches(['/', '\\']));
-        }
+    if let Some((scheme, after)) = url.split_once("://")
+        && is_valid_scheme(scheme)
+    {
+        return (Some(scheme), after.trim_start_matches(['/', '\\']));
     }
     if url.starts_with(['/', '\\']) {
         return (None, url.trim_start_matches(['/', '\\']));
@@ -171,14 +171,14 @@ fn percent_decode_bytes(input: &str) -> Vec<u8> {
     let mut output = Vec::with_capacity(bytes.len());
     let mut index = 0;
     while index < bytes.len() {
-        if bytes[index] == b'%' && index + 2 < bytes.len() {
-            if let (Some(high), Some(low)) =
+        if bytes[index] == b'%'
+            && index + 2 < bytes.len()
+            && let (Some(high), Some(low)) =
                 (hex_value(bytes[index + 1]), hex_value(bytes[index + 2]))
-            {
-                output.push(high << 4 | low);
-                index += 3;
-                continue;
-            }
+        {
+            output.push(high << 4 | low);
+            index += 3;
+            continue;
         }
         output.push(bytes[index]);
         index += 1;

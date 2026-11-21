@@ -196,15 +196,15 @@ fn enrich_deepseek_model(
     model: &mut Map<String, Value>,
     source: &Map<String, Value>,
 ) -> Result<(), &'static str> {
-    if !source.contains_key("display_name") {
-        if let Some(name) = source.get("name").and_then(Value::as_str) {
-            model.insert("display_name".into(), json!(name));
-        }
+    if !source.contains_key("display_name")
+        && let Some(name) = source.get("name").and_then(Value::as_str)
+    {
+        model.insert("display_name".into(), json!(name));
     }
-    if !source.contains_key("max_context_window") {
-        if let Some(context_window) = source.get("context_window") {
-            model.insert("max_context_window".into(), context_window.clone());
-        }
+    if !source.contains_key("max_context_window")
+        && let Some(context_window) = source.get("context_window")
+    {
+        model.insert("max_context_window".into(), context_window.clone());
     }
     model
         .entry("shell_type")
@@ -247,15 +247,15 @@ fn enrich_deepseek_model(
                 .collect::<Result<Vec<Value>, &'static str>>()
         })
         .transpose()?;
-    if let Some(level) = default_level {
-        if !source.contains_key("default_reasoning_level") {
-            model.insert("default_reasoning_level".into(), json!(level));
-        }
+    if let Some(level) = default_level
+        && !source.contains_key("default_reasoning_level")
+    {
+        model.insert("default_reasoning_level".into(), json!(level));
     }
-    if let Some(levels) = supported_levels {
-        if !source.contains_key("supported_reasoning_levels") {
-            model.insert("supported_reasoning_levels".into(), json!(levels));
-        }
+    if let Some(levels) = supported_levels
+        && !source.contains_key("supported_reasoning_levels")
+    {
+        model.insert("supported_reasoning_levels".into(), json!(levels));
     }
     Ok(())
 }

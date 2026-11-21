@@ -632,16 +632,15 @@ fn parse_chat_message(value: &Value) -> Result<LLMMessage, AdapterError> {
         .flatten()
         .map(|annotation| annotation_from_openai(annotation, LLMProtocol::OpenAiChat))
         .collect::<Vec<_>>();
-    if !message_annotations.is_empty() {
-        if let Some(LLMContent {
+    if !message_annotations.is_empty()
+        && let Some(LLMContent {
             kind: LLMContentKind::Text { annotations, .. },
             ..
         }) = content
             .iter_mut()
             .find(|content| matches!(content.kind, LLMContentKind::Text { .. }))
-        {
-            annotations.extend(message_annotations);
-        }
+    {
+        annotations.extend(message_annotations);
     }
     if let Some(reasoning) = value["reasoning_content"]
         .as_str()

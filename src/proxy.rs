@@ -540,10 +540,10 @@ async fn proxy_websocket(
                     AxumMessage::Binary(bytes) => Some(bytes.as_ref()),
                     _ => None,
                 };
-                if let Some(payload) = payload {
-                    if let Err(reason) = check_request_model(&upstream, payload) {
-                        return Some(reason);
-                    }
+                if let Some(payload) = payload
+                    && let Err(reason) = check_request_model(&upstream, payload)
+                {
+                    return Some(reason);
                 }
                 let Some(message) = axum_to_tungstenite(message) else { break };
                 if upstream_sink.send(message).await.is_err() { break; }
@@ -896,15 +896,13 @@ fn plan_generate(
             }
         }
     };
-    if is_codex {
-        if let Err(err) = codex::prepare_request(&mut upstream_json) {
-            return Err(Box::new(protocol_error_response(
-                &input,
-                StatusCode::BAD_REQUEST,
-                &err.to_string(),
-                "invalid_request_error",
-            )));
-        }
+    if is_codex && let Err(err) = codex::prepare_request(&mut upstream_json) {
+        return Err(Box::new(protocol_error_response(
+            &input,
+            StatusCode::BAD_REQUEST,
+            &err.to_string(),
+            "invalid_request_error",
+        )));
     }
 
     let mut derived_headers = HeaderMap::new();
@@ -963,15 +961,15 @@ async fn send_plan(
     for (name, value) in &plan.derived_headers {
         headers.insert(name.clone(), value.clone());
     }
-    if plan.protocol == Protocol::Codex {
-        if let Some(auth) = &state.codex_headers {
-            codex::apply_headers(&mut headers, auth, plan.method == Method::POST);
-        }
+    if plan.protocol == Protocol::Codex
+        && let Some(auth) = &state.codex_headers
+    {
+        codex::apply_headers(&mut headers, auth, plan.method == Method::POST);
     }
-    if plan.conditional {
-        if let Some(etag) = plan.client_headers.get(header::IF_NONE_MATCH) {
-            headers.insert(header::IF_NONE_MATCH, etag.clone());
-        }
+    if plan.conditional
+        && let Some(etag) = plan.client_headers.get(header::IF_NONE_MATCH)
+    {
+        headers.insert(header::IF_NONE_MATCH, etag.clone());
     }
     let client = if !plan.follow_redirects {
         &state.lb_client
@@ -1066,10 +1064,10 @@ async fn attempt_member(
     else {
         return Attempt::Switch("provider is not configured".into());
     };
-    if let LbRequest::Generate { body, .. } = request {
-        if let Err(reason) = check_request_model(upstream, body) {
-            return Attempt::Switch(reason.into());
-        }
+    if let LbRequest::Generate { body, .. } = request
+        && let Err(reason) = check_request_model(upstream, body)
+    {
+        return Attempt::Switch(reason.into());
     }
     if upstream.protocol == Protocol::Codex && state.codex_headers.is_none() {
         return Attempt::Switch("Codex credentials are unavailable".into());

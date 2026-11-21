@@ -19,13 +19,12 @@ pub(crate) fn gemini_http_client() -> reqwest::Result<reqwest::Client> {
 }
 
 pub fn extract_api_key(headers: &HeaderMap, query: Option<&str>) -> Option<String> {
-    if let Some(value) = headers
+    if let Some(token) = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
     {
-        if let Some(token) = value.strip_prefix("Bearer ") {
-            return Some(token.to_string());
-        }
+        return Some(token.to_string());
     }
 
     for name in ["x-api-key", "api-key", "x-goog-api-key"] {
