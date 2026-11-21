@@ -405,7 +405,7 @@ impl StreamAdapter for OpenAiChatAdapter {
                                 .to_string(),
                             arguments: json!({}),
                         },
-                        metadata: Extensions::new(),
+                        metadata: extensions_without(tool, &["id", "type", "function", "index"]),
                     },
                 );
                 events.push(LLMStreamEvent::ToolCallDelta {
@@ -499,9 +499,14 @@ impl StreamAdapter for OpenAiChatAdapter {
                     let target_index = state.target_content_index(*index);
                     state.open_content.insert(target_index);
                     if let LLMContentKind::ToolCall { id, name, .. } = &content.kind {
+                        let mut call = json!({"index": target_index, "id": id, "type": "function", "function": {"name": name, "arguments": ""}});
+                        if id.is_none() && content.source == Some(LLMProtocol::Gemini) {
+                            call["id"] = json!(format!("call_{}", uuid::Uuid::new_v4()));
+                        }
+                        add_tool_call_extra_content(&mut call, content);
                         output.push(chat_stream_event(
                             state,
-                            json!({"tool_calls": [{"index": target_index, "id": id, "type": "function", "function": {"name": name, "arguments": ""}}]}),
+                            json!({"tool_calls": [call]}),
                             None,
                             None,
                         ));
@@ -547,9 +552,16 @@ impl StreamAdapter for OpenAiChatAdapter {
                     arguments_delta,
                 } => {
                     let target_index = state.target_content_index(*index);
+                    let mut call = json!({"index": target_index, "type": "function", "function": {"arguments": arguments_delta}});
+                    if let Some(id) = id {
+                        call["id"] = json!(id);
+                    }
+                    if let Some(name) = name {
+                        call["function"]["name"] = json!(name);
+                    }
                     output.push(chat_stream_event(
                         state,
-                        json!({"tool_calls": [{"index": target_index, "id": id, "type": "function", "function": {"name": name, "arguments": arguments_delta}}]}),
+                        json!({"tool_calls": [call]}),
                         None,
                         None,
                     ));
@@ -759,6 +771,26 @@ fn parse_chat_message(value: &Value) -> Result<LLMMessage, AdapterError> {
     })
 }
 
+fn add_tool_call_extra_content(call: &mut Value, content: &LLMContent) {
+    match content.source {
+        Some(LLMProtocol::Gemini) => {
+            if let Some(signature) = content
+                .metadata
+                .get("thoughtSignature")
+                .and_then(Value::as_str)
+            {
+                call["extra_content"] = json!({"google": {"thought_signature": signature}});
+            }
+        }
+        Some(LLMProtocol::OpenAiChat) => {
+            if let Some(extra) = content.metadata.get("extra_content") {
+                call["extra_content"] = extra.clone();
+            }
+        }
+        _ => {}
+    }
+}
+
 fn chat_message_to_value(message: &LLMMessage) -> Result<Value, AdapterError> {
     if message.role == LLMRole::Tool {
         let result = message
@@ -820,11 +852,15 @@ fn chat_message_to_value(message: &LLMMessage) -> Result<Value, AdapterError> {
                 id,
                 name,
                 arguments,
-            } => Some(json!({
-                "id": id.clone().unwrap_or_else(|| format!("call_{}", uuid::Uuid::new_v4())),
-                "type": "function",
-                "function": {"name": name, "arguments": arguments_to_string(arguments)}
-            })),
+            } => {
+                let mut call = json!({
+                    "id": id.clone().unwrap_or_else(|| format!("call_{}", uuid::Uuid::new_v4())),
+                    "type": "function",
+                    "function": {"name": name, "arguments": arguments_to_string(arguments)}
+                });
+                add_tool_call_extra_content(&mut call, content);
+                Some(call)
+            }
             _ => None,
         })
         .collect::<Vec<_>>();

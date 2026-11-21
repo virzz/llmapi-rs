@@ -64,6 +64,7 @@ pub enum LLMProtocol {
     OpenAiChat,
     OpenAiResponses,
     AnthropicMessages,
+    Gemini,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

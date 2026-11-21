@@ -29,6 +29,7 @@ use super::{
 pub struct AppState {
     pub config: Arc<Config>,
     pub client: reqwest::Client,
+    pub gemini_client: reqwest::Client,
     /// Client used for load-balancer attempts: never follows redirects, so one
     /// member attempt always maps to at most one upstream request.
     pub lb_client: reqwest::Client,
@@ -71,6 +72,7 @@ impl Runtime {
 struct ServerState {
     runtime: watch::Receiver<Arc<Runtime>>,
     client: reqwest::Client,
+    gemini_client: reqwest::Client,
     lb_client: reqwest::Client,
     codex_auth: watch::Receiver<Option<HeaderMap>>,
 }
@@ -91,6 +93,7 @@ impl ServerState {
         AppState {
             config,
             client: self.client.clone(),
+            gemini_client: self.gemini_client.clone(),
             lb_client: self.lb_client.clone(),
             codex_headers,
             lb: runtime.lb.clone(),
@@ -118,6 +121,7 @@ fn app_with_auth(
     let state = ServerState {
         runtime,
         client,
+        gemini_client: auth::gemini_http_client().expect("build Gemini HTTP client"),
         lb_client,
         codex_auth,
     };
@@ -549,8 +553,13 @@ mod tests {
         method: Method,
         uri: Uri,
         headers: HeaderMap,
-        Json(body): Json<Value>,
+        body: Bytes,
     ) -> Response<Body> {
+        let body = if body.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&body).unwrap()
+        };
         *recorded.request.lock().await = Some(CapturedRequest {
             method,
             uri,
@@ -1792,6 +1801,294 @@ mod tests {
         assert_eq!(body["text"]["format"]["type"], "json_schema");
         assert_eq!(body["text"]["format"]["name"], "answer");
         assert!(body["text"]["format"].get("json_schema").is_none());
+    }
+
+    #[tokio::test]
+    async fn gemini_provider_converts_chat_and_uses_the_model_in_the_upstream_path() {
+        let (upstream, captured) = start_upstream(json!({
+            "responseId": "gemini-reply",
+            "modelVersion": "gemini-2.5-flash",
+            "candidates": [{"index": 0, "content": {"role": "model", "parts": [{"text": "pong"}]}, "finishReason": "STOP"}],
+            "usageMetadata": {"promptTokenCount": 3, "candidatesTokenCount": 1, "totalTokenCount": 4}
+        })).await;
+        let config: Config = serde_yaml::from_str(&format!(
+            "default: gemini\nproviders:\n  gemini:\n    type: gemini\n    baseurl: {upstream}/v1beta\n    apikey: gemini-upstream-key\n"
+        )).unwrap();
+        let proxy = start_proxy(config).await;
+        let client = reqwest::Client::new();
+        let response = client.post(format!("http://{proxy}/gemini/v1/chat/completions?key=client-key"))
+            .bearer_auth("client-key")
+            .json(&json!({
+                "model": "gemini-2.5-flash",
+                "messages": [{"role": "system", "content": "Be brief"}, {"role": "user", "content": "ping"}],
+                "max_tokens": 64,
+            }))
+            .send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["choices"][0]["message"]["content"], "pong");
+        assert_eq!(body["choices"][0]["finish_reason"], "stop");
+        assert_eq!(body["usage"]["total_tokens"], 4);
+
+        let request = captured.lock().await.clone().unwrap();
+        assert_eq!(
+            request.uri,
+            "/v1beta/models/gemini-2.5-flash:generateContent"
+        );
+        assert_eq!(request.headers["x-goog-api-key"], "gemini-upstream-key");
+        assert!(!request.headers.contains_key("authorization"));
+        assert_eq!(
+            request.body["systemInstruction"]["parts"][0]["text"],
+            "Be brief"
+        );
+        assert_eq!(request.body["contents"][0]["parts"][0]["text"], "ping");
+        assert_eq!(request.body["generationConfig"]["maxOutputTokens"], 64);
+        assert!(request.body.get("model").is_none());
+
+        let rejected = client.post(format!("http://{proxy}/chat/completions"))
+            .json(&json!({"model": "gemini/../other", "messages": [{"role": "user", "content": "ping"}]}))
+            .send().await.unwrap();
+        assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn gemini_rejects_unresolvable_responses_context_before_forwarding() {
+        let (upstream, captured) = start_upstream(json!({})).await;
+        let mut config = test_config(&upstream);
+        config.providers.insert(
+            "gemini".into(),
+            ProviderConfig::upstream(Protocol::Gemini, upstream, None),
+        );
+        let proxy = start_proxy(config).await;
+        for (field, value) in [
+            ("previous_response_id", json!("resp_1")),
+            ("conversation", json!({"id": "conv_1"})),
+        ] {
+            let mut input = json!({"model": "gemini", "input": "continue"});
+            input[field] = value;
+            let reply = reqwest::Client::new()
+                .post(format!("http://{proxy}/gemini/v1/responses"))
+                .json(&input)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(reply.status(), StatusCode::BAD_REQUEST);
+            assert!(reply.json::<Value>().await.unwrap()["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains(field));
+        }
+        assert!(captured.lock().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn gemini_provider_converts_sse_with_terminal_usage() {
+        let chunks = [
+            json!({"responseId": "gemini-reply", "modelVersion": "gemini-2.5-flash", "candidates": [{"content": {"parts": [{"text": "pong"}]}}]}),
+            json!({"candidates": [{"finishReason": "STOP"}], "usageMetadata": {"promptTokenCount": 3, "candidatesTokenCount": 1, "totalTokenCount": 4}}),
+        ].map(|value| format!("data: {value}\n\n").into_bytes());
+        let (upstream, captured) = start_stream_upstream(chunks.into()).await;
+        let mut config = test_config(&upstream);
+        config.providers.insert(
+            "gemini".into(),
+            ProviderConfig::upstream(Protocol::Gemini, format!("{upstream}/v1beta"), None),
+        );
+        let proxy = start_proxy(config).await;
+        let response = reqwest::Client::new()
+            .post(format!("http://{proxy}/gemini/v1/chat/completions?alt=json&key=ignored"))
+            .header("x-goog-api-key", "gemini-client-key")
+            .json(&json!({"model": "models/gemini-2.5-flash", "messages": [{"role": "user", "content": "ping"}], "stream": true}))
+            .send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["content-type"], "text/event-stream");
+        let body = response.text().await.unwrap();
+        let events = sse_json_events(&body);
+        assert!(events
+            .iter()
+            .any(|event| event["choices"][0]["delta"]["content"] == "pong"));
+        assert!(events
+            .iter()
+            .any(|event| event["choices"][0]["finish_reason"] == "stop"));
+        assert_eq!(events.last().unwrap()["usage"]["total_tokens"], 4);
+        assert!(body.ends_with("data: [DONE]\n\n"));
+        let request = captured.lock().await.clone().unwrap();
+        assert_eq!(
+            request.uri,
+            "/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse"
+        );
+        assert_eq!(request.headers["x-goog-api-key"], "gemini-client-key");
+        assert!(request.body.get("stream").is_none());
+    }
+
+    #[tokio::test]
+    async fn gemini_interactions_proxy_preserves_native_requests_and_lifecycle() {
+        let reply = json!({"id": "v1_test", "status": "in_progress", "steps": []});
+        let (upstream, captured) = start_upstream(reply.clone()).await;
+        let config: Config = serde_yaml::from_str(&format!(
+            "default: gemini\napikey: client-key\nproviders:\n  gemini:\n    type: gemini\n    baseurl: {upstream}/v1\n    apikey: upstream-key\n    models: [gemini-2.5-flash]\n"
+        )).unwrap();
+        let proxy = start_proxy(config).await;
+        let client = reqwest::Client::new();
+        let request = json!({
+            "model": "gemini-2.5-flash", "input": "Continue", "previous_interaction_id": "v1_previous",
+            "store": true, "tools": [{"type": "google_search"}]
+        });
+        let created = client
+            .post(format!("http://{proxy}/v1/interactions?key=client-key"))
+            .json(&request)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::OK);
+        assert_eq!(created.json::<Value>().await.unwrap(), reply);
+        let sent = captured.lock().await.take().unwrap();
+        assert_eq!(sent.method, Method::POST);
+        assert_eq!(sent.uri, "/v1/interactions");
+        assert_eq!(sent.headers["x-goog-api-key"], "upstream-key");
+        assert_eq!(sent.body, request);
+
+        for (method, path, upstream_path) in [
+            (
+                Method::GET,
+                "/gemini/v1/interactions/v1_test?include_input=true",
+                "/v1/interactions/v1_test?include_input=true",
+            ),
+            (
+                Method::POST,
+                "/gemini/interactions/v1_test/cancel",
+                "/v1/interactions/v1_test/cancel",
+            ),
+            (
+                Method::DELETE,
+                "/v1/interactions/v1_test",
+                "/v1/interactions/v1_test",
+            ),
+        ] {
+            let response = client
+                .request(method.clone(), format!("http://{proxy}{path}"))
+                .header("x-goog-api-key", "client-key")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let sent = captured.lock().await.take().unwrap();
+            assert_eq!(sent.method, method);
+            assert_eq!(sent.uri, upstream_path);
+            assert!(sent.body.is_null());
+        }
+
+        let denied = client
+            .post(format!("http://{proxy}/v1/interactions"))
+            .bearer_auth("client-key")
+            .json(&json!({"model": "gemini-2.5-pro", "input": "ping"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::BAD_REQUEST);
+        let wrong_method = client
+            .get(format!("http://{proxy}/v1/interactions/v1_test/cancel"))
+            .bearer_auth("client-key")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(wrong_method.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(wrong_method.headers()["allow"], "POST");
+        assert!(captured.lock().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn gemini_interactions_proxy_preserves_native_sse_events() {
+        let events = concat!(
+            "data: {\"event_id\":\"next\",\"event_type\":\"interaction.created\",\"interaction\":{\"id\":\"v1_test\",\"status\":\"in_progress\"}}\n\n",
+            "data: {\"event_type\":\"interaction.completed\",\"interaction\":{\"id\":\"v1_test\",\"status\":\"completed\"}}\n\n"
+        );
+        let (upstream, captured) = start_stream_upstream(vec![events.as_bytes().to_vec()]).await;
+        let mut config = test_config(&upstream);
+        config.providers.insert(
+            "gemini".into(),
+            ProviderConfig::upstream(Protocol::Gemini, format!("{upstream}/v1"), None),
+        );
+        let proxy = start_proxy(config).await;
+        let response = reqwest::Client::new()
+            .post(format!("http://{proxy}/gemini/v1/interactions"))
+            .header("accept", "text/event-stream")
+            .json(&json!({"model": "gemini-2.5-flash", "input": "ping", "stream": true}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["content-type"], "text/event-stream");
+        assert_eq!(response.text().await.unwrap(), events);
+        let sent = captured.lock().await.take().unwrap();
+        assert_eq!(sent.uri, "/v1/interactions");
+        assert_eq!(sent.headers["accept"], "text/event-stream");
+        assert_eq!(sent.body["stream"], true);
+
+        let resumed = reqwest::Client::new()
+            .get(format!(
+                "http://{proxy}/gemini/v1/interactions/v1_test?stream=true&last_event_id=next"
+            ))
+            .header("accept", "text/event-stream")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resumed.status(), StatusCode::OK);
+        assert_eq!(resumed.text().await.unwrap(), events);
+        let sent = captured.lock().await.take().unwrap();
+        assert_eq!(
+            sent.uri,
+            "/v1/interactions/v1_test?stream=true&last_event_id=next"
+        );
+        assert!(sent.body.is_null());
+    }
+
+    #[tokio::test]
+    async fn gemini_provider_normalizes_and_filters_the_model_catalog() {
+        let (upstream, captured) = start_upstream(json!({
+            "models": [
+                {"name": "models/gemini-2.5-flash", "displayName": "Gemini Flash", "inputTokenLimit": 1048576, "outputTokenLimit": 65536, "supportedGenerationMethods": ["generateContent"]},
+                {"name": "models/gemini-2.5-pro", "supportedGenerationMethods": ["generateContent"]},
+                {"name": "models/gemini-embedding", "supportedGenerationMethods": ["embedContent"]}
+            ],
+            "nextPageToken": "next"
+        })).await;
+        let mut config = test_config(&upstream);
+        let mut provider =
+            ProviderConfig::upstream(Protocol::Gemini, format!("{upstream}/v1"), None);
+        provider.as_upstream_mut().unwrap().models =
+            vec!["gemini-2.5-flash".into(), "gemini-embedding".into()];
+        config.providers.insert("gemini".into(), provider);
+        let proxy = start_proxy(config).await;
+        let client = reqwest::Client::new();
+        for codex in [false, true] {
+            let response = client
+                .get(format!(
+                    "http://{proxy}/gemini/v1/models?pageSize=10&pageToken=previous"
+                ))
+                .header(
+                    "user-agent",
+                    if codex { "codex-cli" } else { "test-client" },
+                )
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body: Value = response.json().await.unwrap();
+            if codex {
+                assert_eq!(body["models"].as_array().unwrap().len(), 1);
+                assert_eq!(body["models"][0]["slug"], "gemini-2.5-flash");
+                assert_eq!(body["models"][0]["display_name"], "Gemini Flash");
+                assert_eq!(body["models"][0]["context_window"], 1048576);
+                assert_eq!(body["models"][0]["max_output_tokens"], 65536);
+            } else {
+                assert_eq!(body["data"].as_array().unwrap().len(), 1);
+                assert_eq!(body["data"][0]["id"], "gemini-2.5-flash");
+                assert_eq!(body["data"][0]["max_output_tokens"], 65536);
+            }
+            assert_eq!(body["nextPageToken"], "next");
+        }
+        let request = captured.lock().await.clone().unwrap();
+        assert_eq!(request.uri, "/v1/models?pageSize=10&pageToken=previous");
     }
 
     #[tokio::test]

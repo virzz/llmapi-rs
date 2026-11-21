@@ -75,7 +75,7 @@ enum Command {
 struct AddArgs {
     /// Provider name used in HTTP route prefixes
     name: String,
-    /// Provider type: openai-chat|chat, openai-responses|responses, anthropic|messages, llmapi, lb
+    /// Provider type: openai-chat|chat, openai-responses|responses, anthropic|messages, gemini, llmapi, lb
     #[arg(long = "type")]
     provider_type: Provider,
     /// Upstream API base URL (required unless --members is used)
@@ -214,10 +214,6 @@ impl Cmd {
         }
         let (name, provider) = config.provider(args.provider.as_deref())?;
         let (name, provider) = (name.to_owned(), provider.clone());
-        let client = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(15))
-            .build()
-            .context("build HTTP client")?;
         let deadline = Instant::now() + Duration::from_secs(args.timeout);
         let probe = if args.model.is_some() {
             "model"
@@ -226,6 +222,14 @@ impl Cmd {
         };
         match &provider {
             ProviderConfig::Upstream(upstream) => {
+                let client = if upstream.protocol == Protocol::Gemini {
+                    auth::gemini_http_client()
+                } else {
+                    reqwest::Client::builder()
+                        .connect_timeout(Duration::from_secs(15))
+                        .build()
+                }
+                .context("build HTTP client")?;
                 let timeout = remaining_budget(deadline)?;
                 let outcome = probe_provider(
                     &client,
@@ -553,6 +557,14 @@ async fn send_probe(
                 "messages": [{"role": "user", "content": "ping"}]
             })),
         ),
+        (Protocol::Gemini, Some(_)) => (
+            Method::POST,
+            "/models",
+            Some(json!({
+                "contents": [{"role": "user", "parts": [{"text": "ping"}]}],
+                "generationConfig": {"maxOutputTokens": 16}
+            })),
+        ),
         (Protocol::Codex, Some(model)) => {
             let mut body = json!({"model": model, "input": "ping"});
             codex::prepare_request(&mut body)?;
@@ -567,7 +579,12 @@ async fn send_probe(
         .map(|body| serde_json::to_vec(&body))
         .transpose()
         .context("serialize probe request")?;
-    let mut url = proxy::upstream_url(&upstream.base_url, path, None);
+    let mut url = match (upstream.protocol, model) {
+        (Protocol::Gemini, Some(model)) => {
+            proxy::gemini_generate_url(&upstream.base_url, model, false, None)?
+        }
+        _ => proxy::upstream_url(&upstream.base_url, path, None),
+    };
     if codex && model.is_none() {
         url.push(if url.contains('?') { '&' } else { '?' });
         url.push_str("client_version=");
@@ -648,6 +665,13 @@ async fn finish_probe(
             let body = read_probe_body(response).await?;
             serde_json::from_slice::<Value>(&body)
                 .ok()
+                .and_then(|value| {
+                    if protocol == Protocol::Gemini {
+                        models::from_gemini_catalog(value).ok()
+                    } else {
+                        Some(value)
+                    }
+                })
                 .and_then(|value| model_count(&value))
                 .map(|count| format!("{count} models"))
                 .unwrap_or_else(|| "reachable".into())
@@ -830,6 +854,11 @@ fn response_text(protocol: Protocol, body: &[u8]) -> Option<String> {
                     })
                 }),
             Protocol::Anthropic => value.get("content")?.as_array()?.iter().find_map(json_text),
+            Protocol::Gemini => value["candidates"][0]["content"]["parts"]
+                .as_array()?
+                .iter()
+                .filter(|part| part["thought"] != true)
+                .find_map(|part| part["text"].as_str().map(str::to_owned)),
             Protocol::Codex => None,
         }?;
     Some(text)
@@ -1397,6 +1426,36 @@ mod tests {
 
         let rejected = probe_provider(&client, &provider, None, Some("other-model"), None).await;
         assert!(matches!(rejected, Err(err) if err.to_string().contains("model is not allowed")));
+    }
+
+    #[tokio::test]
+    async fn check_gemini_model_uses_native_endpoint_and_reply() {
+        let upstream = spawn_upstream(Router::new().route(
+            "/v1beta/models/gemini-2.5-flash:generateContent",
+            post(|headers: HeaderMap, Json(body): Json<Value>| async move {
+                assert_eq!(headers["x-goog-api-key"], "gemini-key");
+                assert_eq!(body["contents"][0]["parts"][0]["text"], "ping");
+                assert!(body.get("model").is_none());
+                Json(json!({"candidates": [{"content": {"parts": [{"text": "pong"}]}}]}))
+            }),
+        ))
+        .await;
+        let upstream = ProviderConfig::upstream(
+            Protocol::Gemini,
+            format!("{upstream}/v1beta"),
+            Some("gemini-key".into()),
+        );
+        let outcome = probe_provider(
+            &reqwest::Client::new(),
+            upstream.as_upstream().unwrap(),
+            None,
+            Some("gemini-2.5-flash"),
+            Some(Duration::from_secs(2)),
+        )
+        .await
+        .unwrap();
+        assert!(outcome.status.is_success());
+        assert_eq!(outcome.detail, "reply: pong");
     }
 
     #[tokio::test]
@@ -2468,6 +2527,39 @@ mod tests {
             0,
             "an accepted response must never be replayed"
         );
+    }
+
+    #[tokio::test]
+    async fn gemini_client_only_follows_same_origin_redirects() {
+        use axum::response::Redirect;
+        let upstream = spawn_upstream(
+            Router::new()
+                .route("/same", get(|| async { Redirect::temporary("/done") }))
+                .route("/done", get(|| async { "ok" }))
+                .route(
+                    "/other",
+                    get(|| async { Redirect::temporary("http://127.0.0.1:0/done") }),
+                ),
+        )
+        .await;
+        let client = auth::gemini_http_client().unwrap();
+        assert_eq!(
+            client
+                .get(format!("{upstream}/same"))
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap(),
+            "ok"
+        );
+        let error = client
+            .get(format!("{upstream}/other"))
+            .send()
+            .await
+            .unwrap_err();
+        assert!(error.is_redirect());
     }
 
     #[tokio::test]

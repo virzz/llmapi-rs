@@ -6,6 +6,7 @@ pub enum InputFormat {
     OpenAiResponses,
     AnthropicMessages,
     Models,
+    GeminiInteractions,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -13,6 +14,7 @@ pub enum UpstreamFormat {
     OpenAiChat,
     OpenAiResponses,
     AnthropicMessages,
+    Gemini,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,14 +31,62 @@ pub fn detect_route(path: &str) -> Option<Route> {
         });
     }
 
-    let (provider, endpoint) = path.strip_prefix('/')?.split_once('/')?;
-    if provider.is_empty() || provider.contains('/') {
+    let named = path
+        .strip_prefix('/')?
+        .split_once('/')
+        .filter(|(provider, _)| !provider.is_empty());
+    if let Some((provider, endpoint)) = named
+        && let Some(input) = detect_endpoint(&format!("/{endpoint}"))
+    {
+        return Some(Route {
+            provider: Some(provider.to_string()),
+            input,
+        });
+    }
+    if interactions_endpoint(path).is_some() {
+        return Some(Route {
+            provider: None,
+            input: InputFormat::GeminiInteractions,
+        });
+    }
+    let (provider, _) = named?;
+    interactions_endpoint(&path[provider.len() + 1..]).map(|_| Route {
+        provider: Some(provider.to_string()),
+        input: InputFormat::GeminiInteractions,
+    })
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InteractionsEndpoint {
+    Create,
+    Item,
+    Cancel,
+}
+
+pub(crate) fn interactions_endpoint(path: &str) -> Option<(&str, InteractionsEndpoint)> {
+    let path = path
+        .strip_prefix("/v1beta")
+        .or_else(|| path.strip_prefix("/v1"))
+        .filter(|path| path.starts_with('/'))
+        .unwrap_or(path);
+    if path == "/interactions" {
+        return Some((path, InteractionsEndpoint::Create));
+    }
+    let resource = path.strip_prefix("/interactions/")?;
+    let (id, endpoint) = match resource.split_once('/') {
+        None => (resource, InteractionsEndpoint::Item),
+        Some((id, "cancel")) => (id, InteractionsEndpoint::Cancel),
+        _ => return None,
+    };
+    if id.is_empty()
+        || matches!(id, "." | "..")
+        || !id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~'))
+    {
         return None;
     }
-    detect_endpoint(&format!("/{endpoint}")).map(|input| Route {
-        provider: Some(provider.to_string()),
-        input,
-    })
+    Some((path, endpoint))
 }
 
 fn detect_endpoint(path: &str) -> Option<InputFormat> {
@@ -49,7 +99,8 @@ fn detect_endpoint(path: &str) -> Option<InputFormat> {
     }
 }
 
-/// Canonical upstream endpoint. Chat is the default for a relay without a client format.
+/// Canonical upstream endpoint, or the resource prefix for Gemini's model-specific endpoint.
+/// Chat is the default for a relay without a client format.
 pub fn upstream_for(protocol: Protocol) -> (UpstreamFormat, &'static str) {
     match protocol {
         Protocol::OpenAiChat | Protocol::Llmapi => {
@@ -59,6 +110,7 @@ pub fn upstream_for(protocol: Protocol) -> (UpstreamFormat, &'static str) {
             (UpstreamFormat::OpenAiResponses, "/responses")
         }
         Protocol::Anthropic => (UpstreamFormat::AnthropicMessages, "/messages"),
+        Protocol::Gemini => (UpstreamFormat::Gemini, "/models"),
     }
 }
 

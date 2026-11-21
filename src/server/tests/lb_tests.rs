@@ -1370,6 +1370,7 @@ async fn snapshot_keeps_config_and_cursors_on_the_same_version() {
         runtime,
         client: reqwest::Client::new(),
         lb_client: reqwest::Client::new(),
+        gemini_client: auth::gemini_http_client().unwrap(),
         codex_auth: watch::channel(None).1,
     };
 

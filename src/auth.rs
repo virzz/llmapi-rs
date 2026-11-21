@@ -2,6 +2,22 @@ use axum::http::{header, HeaderMap, HeaderValue};
 
 use super::config::Protocol;
 
+pub(crate) fn gemini_http_client() -> reqwest::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if attempt
+                .previous()
+                .last()
+                .is_some_and(|previous| previous.origin() != attempt.url().origin())
+            {
+                return attempt.error("Gemini cross-origin redirect");
+            }
+            reqwest::redirect::Policy::default().redirect(attempt)
+        }))
+        .build()
+}
+
 pub fn extract_api_key(headers: &HeaderMap, query: Option<&str>) -> Option<String> {
     if let Some(value) = headers
         .get(header::AUTHORIZATION)
@@ -12,7 +28,7 @@ pub fn extract_api_key(headers: &HeaderMap, query: Option<&str>) -> Option<Strin
         }
     }
 
-    for name in ["x-api-key", "api-key"] {
+    for name in ["x-api-key", "api-key", "x-goog-api-key"] {
         if let Some(value) = headers.get(name).and_then(|v| v.to_str().ok()) {
             return Some(value.to_string());
         }
@@ -38,9 +54,14 @@ pub fn apply_api_key(
                 headers.insert(header::AUTHORIZATION, value);
             }
         }
-        Protocol::Anthropic => {
+        Protocol::Anthropic | Protocol::Gemini => {
             if let Ok(value) = HeaderValue::from_str(key) {
-                headers.insert("x-api-key", value);
+                let header = if protocol == Protocol::Gemini {
+                    "x-goog-api-key"
+                } else {
+                    "x-api-key"
+                };
+                headers.insert(header, value);
             }
         }
     }
@@ -90,6 +111,7 @@ pub fn apply_protocol_headers(headers: &mut HeaderMap, protocol: Protocol, sourc
                 }
             }
         }
+        Protocol::Gemini => {}
     }
 }
 

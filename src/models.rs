@@ -25,6 +25,46 @@ pub fn restrict_catalog(value: &mut Value, models: &[String]) {
     }
 }
 
+pub fn from_gemini_catalog(mut value: Value) -> Result<Value, &'static str> {
+    let catalog = value
+        .as_object_mut()
+        .ok_or("Gemini models response is not an object")?;
+    let mut entries = match catalog.remove("models") {
+        Some(Value::Array(entries)) => entries,
+        None => Vec::new(),
+        Some(_) => return Err("Gemini models response has an invalid models array"),
+    };
+    entries.retain(|entry| {
+        entry["supportedGenerationMethods"]
+            .as_array()
+            .is_none_or(|methods| methods.iter().any(|method| method == "generateContent"))
+    });
+    for entry in &mut entries {
+        let id = entry["name"]
+            .as_str()
+            .and_then(|name| name.strip_prefix("models/"))
+            .filter(|id| !id.is_empty())
+            .ok_or("Gemini model has no valid name")?
+            .to_owned();
+        for (source, target) in [
+            ("displayName", "display_name"),
+            ("inputTokenLimit", "context_window"),
+            ("outputTokenLimit", "max_output_tokens"),
+        ] {
+            if let Some(field) = entry.get(source).cloned() {
+                entry[target] = field;
+            }
+        }
+        entry["id"] = json!(id);
+        entry["object"] = json!("model");
+        entry["created"] = json!(0);
+        entry["owned_by"] = json!("google");
+    }
+    catalog.insert("object".into(), json!("list"));
+    catalog.insert("data".into(), Value::Array(entries));
+    Ok(value)
+}
+
 pub fn for_client(value: Value, codex: bool) -> Result<Value, &'static str> {
     if codex {
         if value.get("models").and_then(Value::as_array).is_some() {
@@ -40,7 +80,11 @@ pub fn for_client(value: Value, codex: bool) -> Result<Value, &'static str> {
             .iter()
             .map(to_codex_model)
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(json!({"models": models}))
+        let mut output = json!({"models": models});
+        if let Some(token) = value.get("nextPageToken") {
+            output["nextPageToken"] = token.clone();
+        }
+        Ok(output)
     } else {
         if value.get("data").and_then(Value::as_array).is_some() {
             let mut value = value;

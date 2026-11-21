@@ -37,7 +37,7 @@ curl -H "Authorization: Bearer $LLMAPI_API_KEY" http://127.0.0.1:8080/providers
 llmapi list # 别名 ls、l
 llmapi check [provider] [--model <model>] [--timeout <seconds>]
 llmapi completion [bash|elvish|fish|powershell|zsh] # 别名: comp
-llmapi add <name> --type <chat|responses|messages|llmapi> --baseurl <url> [--apikey|--apikey-stdin] # 别名 a
+llmapi add <name> --type <chat|responses|messages|gemini|llmapi> --baseurl <url> [--apikey|--apikey-stdin] # 别名 a
 llmapi add <name> --type lb --members <provider,provider>
 llmapi rm <name>
 llmapi set default <provider>
@@ -94,6 +94,30 @@ journalctl --user -u llmapi.service -f
 `GET /models` 和 `GET /v1/models`（也支持 `/{provider}` 前缀）接受上游 OpenAI `data` 或 Codex `models` 列表，并按所选 provider 的模型限制过滤。Codex 请求（通过 `client_version` 或 Codex User-Agent 识别）收到 `models`；其他客户端收到 OpenAI `data`。格式转换时会补齐缺失的元数据。
 
 `GET /providers` 返回当前默认 provider 和所有已配置 provider。每个已配置的 `apikey` 返回为 `***`；未设置的密钥会被省略。该端点不会展开环境变量，也不会联系上游 provider。
+
+## Gemini 上游
+
+```toml
+[providers.gemini]
+type = "gemini"
+baseurl = "https://generativelanguage.googleapis.com/v1"
+apikey = "${GEMINI_API_KEY}"
+```
+
+通过 `/gemini/v1/chat/completions`、`/gemini/v1/responses` 或 `/gemini/v1/messages` 使用 Gemini 模型，例如 `gemini-2.5-flash`。代理按请求的 `stream` 字段调用 Google 的 `generateContent` 或 `streamGenerateContent`。模型列表可通过 `/gemini/v1/models` 获取，也可用 `llmapi check gemini --model gemini-2.5-flash` 探测生成接口。
+
+`GET /gemini/v1/models` 将 Gemini 模型列表转换为 OpenAI 或 Codex 格式，保留模型名称、token 限制和 `nextPageToken`。使用 `pageSize` 与 `pageToken` 翻页。
+
+Interactions API 使用同一个 Gemini provider。请求体、上游响应和 SSE 事件按原格式转发。后续操作应使用创建交互时的 provider。
+
+| 方法 | 路由 | 操作 |
+| --- | --- | --- |
+| POST | `/gemini/v1/interactions` | 创建 |
+| GET | `/gemini/v1/interactions/{id}` | 读取或续读 SSE |
+| POST | `/gemini/v1/interactions/{id}/cancel` | 取消 |
+| DELETE | `/gemini/v1/interactions/{id}` | 删除 |
+
+默认 provider 为 Gemini 时可以省略 `/gemini` 前缀。上游 API 版本由 `baseurl` 决定。
 
 ## llmapi 中继
 

@@ -45,7 +45,7 @@ or `http://127.0.0.1:8080/openai/v1` to select `openai` explicitly. See the
 llmapi list # aliases: ls, l
 llmapi check [provider] [--model <model>] [--timeout <seconds>]
 llmapi completion [bash|elvish|fish|powershell|zsh] # alias: comp
-llmapi add <name> --type <chat|responses|messages|llmapi> --baseurl <url> [--apikey|--apikey-stdin] # alias: a
+llmapi add <name> --type <chat|responses|messages|gemini|llmapi> --baseurl <url> [--apikey|--apikey-stdin] # alias: a
 llmapi add <name> --type lb --members <provider,provider>
 llmapi rm <name>
 llmapi set default <provider>
@@ -157,6 +157,39 @@ OpenAI `data`. Missing metadata is synthesized when converting between formats.
 `GET /providers` returns the active default and all configured providers. Each
 configured `apikey` is returned as `***`; unset keys are omitted. The endpoint
 does not resolve environment variables or contact upstream providers.
+
+## Gemini upstream
+
+```toml
+[providers.gemini]
+type = "gemini"
+baseurl = "https://generativelanguage.googleapis.com/v1"
+apikey = "${GEMINI_API_KEY}"
+```
+
+Use a Gemini model such as `gemini-2.5-flash` through
+`/gemini/v1/chat/completions`, `/gemini/v1/responses`, or `/gemini/v1/messages`.
+The proxy calls Google's `generateContent` or `streamGenerateContent` endpoint
+according to the request's `stream` field. List models at `/gemini/v1/models` or
+probe generation with `llmapi check gemini --model gemini-2.5-flash`.
+
+`GET /gemini/v1/models` converts the Gemini model list to OpenAI or Codex
+format, preserving model names, token limits, and `nextPageToken`. Use
+`pageSize` and `pageToken` to request another page.
+
+The Interactions API uses the same Gemini provider. Request bodies, upstream
+responses, and SSE events are forwarded in their native format. Use the
+provider that created the interaction for all subsequent operations.
+
+| Method | Route | Operation |
+| --- | --- | --- |
+| POST | `/gemini/v1/interactions` | Create |
+| GET | `/gemini/v1/interactions/{id}` | Get or resume SSE |
+| POST | `/gemini/v1/interactions/{id}/cancel` | Cancel |
+| DELETE | `/gemini/v1/interactions/{id}` | Delete |
+
+Omit the `/gemini` prefix when Gemini is the default provider. The `baseurl`
+sets the upstream API version.
 
 ## llmapi relay
 

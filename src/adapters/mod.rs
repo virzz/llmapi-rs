@@ -1,4 +1,5 @@
 pub mod anthropic;
+pub mod gemini;
 pub mod openai_chat;
 pub mod openai_responses;
 
@@ -181,6 +182,7 @@ pub struct StreamState {
     pub tool_call_ids: BTreeMap<usize, String>,
     pub completed_items: Vec<Value>,
     pub tool_indices: BTreeMap<usize, usize>,
+    pub pending_content: BTreeMap<usize, LLMContent>,
     pub sequence_number: u64,
     pub finish_reason: Option<LLMFinishReason>,
     pub usage: Option<LLMUsage>,

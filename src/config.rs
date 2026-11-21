@@ -78,6 +78,7 @@ pub enum Protocol {
     OpenAiChat,
     OpenAiResponses,
     Anthropic,
+    Gemini,
     Llmapi,
     Codex,
 }
@@ -93,6 +94,9 @@ pub enum Provider {
     #[serde(rename = "anthropic", alias = "messages")]
     #[value(name = "anthropic", alias = "messages")]
     Anthropic,
+    #[serde(rename = "gemini")]
+    #[value(name = "gemini")]
+    Gemini,
     /// Relay to another llmapi server using the client's protocol.
     #[serde(rename = "llmapi")]
     #[value(name = "llmapi")]
@@ -462,6 +466,7 @@ impl Provider {
             Self::OpenAiChat => "openai-chat",
             Self::OpenAiResponses => "openai-responses",
             Self::Anthropic => "anthropic",
+            Self::Gemini => "gemini",
             Self::Llmapi => "llmapi",
             Self::Codex => "codex",
             Self::Lb => LB_TYPE,
@@ -474,6 +479,7 @@ impl Provider {
             Self::OpenAiChat => Some(Protocol::OpenAiChat),
             Self::OpenAiResponses => Some(Protocol::OpenAiResponses),
             Self::Anthropic => Some(Protocol::Anthropic),
+            Self::Gemini => Some(Protocol::Gemini),
             Self::Llmapi => Some(Protocol::Llmapi),
             Self::Codex => Some(Protocol::Codex),
             Self::Lb => None,
@@ -487,6 +493,7 @@ impl Protocol {
             Self::OpenAiChat => "openai-chat",
             Self::OpenAiResponses => "openai-responses",
             Self::Anthropic => "anthropic",
+            Self::Gemini => "gemini",
             Self::Llmapi => "llmapi",
             Self::Codex => "codex",
         }

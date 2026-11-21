@@ -11,7 +11,7 @@ use tracing::{debug, error, info, warn};
 
 use super::{
     adapters::{
-        anthropic::AnthropicAdapter, openai_chat::OpenAiChatAdapter,
+        anthropic::AnthropicAdapter, gemini::GeminiAdapter, openai_chat::OpenAiChatAdapter,
         openai_responses::OpenAiResponsesAdapter, AdapterError, RequestAdapter, ResponseAdapter,
         SseDecoder, SseEvent, StreamAdapter, StreamState,
     },
@@ -20,7 +20,10 @@ use super::{
     lb,
     model::{LLMRequest, LLMResponse},
     models,
-    protocol::{detect_route, is_transparent, upstream_for_input, InputFormat, UpstreamFormat},
+    protocol::{
+        detect_route, interactions_endpoint, is_transparent, upstream_for_input, InputFormat,
+        InteractionsEndpoint, UpstreamFormat,
+    },
     redact,
     server::AppState,
 };
@@ -32,6 +35,7 @@ const RESPONSE_MODE_HEADER: &str = "x-llmapi-response-mode";
 /// How an upstream response becomes a client response.
 enum ResponseMode {
     Models {
+        protocol: Protocol,
         codex_client: bool,
         allow_etag: bool,
         models: Vec<String>,
@@ -173,7 +177,7 @@ pub async fn handle_with_websocket(
     } else {
         Method::POST
     };
-    if method != expected_method {
+    if route.input != InputFormat::GeminiInteractions && method != expected_method {
         return protocol_error_response(
             &route.input,
             StatusCode::METHOD_NOT_ALLOWED,
@@ -197,6 +201,18 @@ pub async fn handle_with_websocket(
         }
     };
     let input = route.input;
+
+    if input == InputFormat::GeminiInteractions {
+        let path = route
+            .provider
+            .as_deref()
+            .map_or(request_path.as_str(), |provider| {
+                &request_path[provider.len() + 1..]
+            });
+        let (path, endpoint) =
+            interactions_endpoint(path).expect("interactions route contains a validated endpoint");
+        return proxy_interactions(&state, &provider, headers, request, path, endpoint).await;
+    }
 
     if input == InputFormat::Models {
         let codex_client = models::is_codex_client(&headers, query.as_deref());
@@ -345,6 +361,101 @@ pub async fn handle_with_websocket(
         "upstream response received"
     );
     build_response(plan.mode, upstream_response).await
+}
+
+async fn proxy_interactions(
+    state: &AppState,
+    provider: &ProviderConfig,
+    client_headers: HeaderMap,
+    request: axum::http::Request<Body>,
+    path: &str,
+    endpoint: InteractionsEndpoint,
+) -> Response<Body> {
+    let input = InputFormat::GeminiInteractions;
+    let (allow, supported) = match endpoint {
+        InteractionsEndpoint::Create | InteractionsEndpoint::Cancel => {
+            ("POST", request.method() == Method::POST)
+        }
+        InteractionsEndpoint::Item => (
+            "GET, DELETE",
+            matches!(*request.method(), Method::GET | Method::DELETE),
+        ),
+    };
+    if !supported {
+        let mut response = protocol_error_response(
+            &input,
+            StatusCode::METHOD_NOT_ALLOWED,
+            "method is not supported for this Interaction endpoint",
+            "invalid_request_error",
+        );
+        response
+            .headers_mut()
+            .insert(header::ALLOW, HeaderValue::from_static(allow));
+        return response;
+    }
+    // Stateful requests must use the same upstream and credentials throughout their lifecycle.
+    let Some(upstream) = provider
+        .as_upstream()
+        .filter(|upstream| upstream.protocol == Protocol::Gemini)
+    else {
+        return protocol_error_response(
+            &input,
+            StatusCode::BAD_REQUEST,
+            "Interactions requires a concrete gemini provider",
+            "invalid_request_error",
+        );
+    };
+    let (parts, body) = request.into_parts();
+    let body = match to_bytes(body, MAX_JSON_BODY_BYTES).await {
+        Ok(body) => body,
+        Err(err) => {
+            return protocol_error_response(
+                &input,
+                StatusCode::BAD_REQUEST,
+                &err.to_string(),
+                "invalid_request_error",
+            );
+        }
+    };
+    if endpoint == InteractionsEndpoint::Create
+        && let Err(reason) = check_request_model(upstream, &body)
+    {
+        return protocol_error_response(
+            &input,
+            StatusCode::BAD_REQUEST,
+            reason,
+            "invalid_request_error",
+        );
+    }
+    let api_key = match upstream.api_key() {
+        Ok(api_key) => api_key,
+        Err(err) => {
+            return protocol_error_response(
+                &input,
+                StatusCode::BAD_GATEWAY,
+                &err.to_string(),
+                "api_error",
+            );
+        }
+    };
+    let query = parts.uri.query();
+    let plan = RequestPlan {
+        protocol: upstream.protocol,
+        method: parts.method,
+        url: upstream_url(&upstream.base_url, path, query),
+        query: query.map(ToString::to_string),
+        api_key,
+        client_headers,
+        derived_headers: HeaderMap::new(),
+        body,
+        mode: ResponseMode::Raw,
+        conditional: false,
+        follow_redirects: false,
+    };
+    match send_plan(state, &plan, None).await {
+        Ok(upstream_response) => build_response(plan.mode, upstream_response).await,
+        Err(err) => send_error_response(&input, err, None),
+    }
 }
 
 fn send_error_response(
@@ -510,11 +621,12 @@ fn tungstenite_to_axum(message: tokio_tungstenite::tungstenite::Message) -> Opti
 
 async fn models_response(
     upstream: reqwest::Response,
+    protocol: Protocol,
     codex_client: bool,
     allow_etag: bool,
     models: &[String],
 ) -> Response<Body> {
-    let mut response = models_response_inner(upstream, codex_client, models).await;
+    let mut response = models_response_inner(upstream, protocol, codex_client, models).await;
     if !allow_etag {
         // The upstream validator does not describe this catalog.
         response.headers_mut().remove(header::ETAG);
@@ -524,6 +636,7 @@ async fn models_response(
 
 async fn models_response_inner(
     upstream: reqwest::Response,
+    protocol: Protocol,
     codex_client: bool,
     allowed_models: &[String],
 ) -> Response<Body> {
@@ -565,7 +678,7 @@ async fn models_response_inner(
     };
     let native = value.get(desired_key).and_then(Value::as_array).is_some()
         && value.get(other_key).is_none();
-    if native && allowed_models.is_empty() {
+    if protocol != Protocol::Gemini && native && allowed_models.is_empty() {
         let mut response = response(status, body, "application/json");
         copy_response_metadata_headers(&headers, response.headers_mut());
         if let Some(etag) = headers.get(header::ETAG) {
@@ -575,6 +688,19 @@ async fn models_response_inner(
             .headers_mut()
             .append(header::VARY, HeaderValue::from_static("User-Agent"));
         return response;
+    }
+    if protocol == Protocol::Gemini {
+        value = match models::from_gemini_catalog(value) {
+            Ok(value) => value,
+            Err(err) => {
+                return protocol_error_response(
+                    &InputFormat::Models,
+                    StatusCode::BAD_GATEWAY,
+                    err,
+                    "api_error",
+                );
+            }
+        };
     }
     if !allowed_models.is_empty() {
         models::restrict_catalog(&mut value, allowed_models);
@@ -611,7 +737,8 @@ fn plan_models(
     allow_etag: bool,
     follow_redirects: bool,
 ) -> RequestPlan {
-    let allow_etag = allow_etag && upstream.models.is_empty();
+    let allow_etag =
+        allow_etag && upstream.models.is_empty() && upstream.protocol != Protocol::Gemini;
     let mut url = upstream_url(&upstream.base_url, "/models", query);
     if upstream.protocol == Protocol::Codex && !has_client_version(query) {
         url.push(if url.contains('?') { '&' } else { '?' });
@@ -628,6 +755,7 @@ fn plan_models(
         derived_headers: HeaderMap::new(),
         body: Bytes::new(),
         mode: ResponseMode::Models {
+            protocol: upstream.protocol,
             codex_client,
             allow_etag,
             models: upstream.models.clone(),
@@ -671,20 +799,21 @@ fn plan_generate(
         follow_redirects,
     } = request;
     let (upstream_format, path) = upstream_for_input(upstream.protocol, input);
-    let url = upstream_url(&upstream.base_url, path, query);
-    let make = |body: Bytes, derived_headers: HeaderMap, mode: ResponseMode| RequestPlan {
-        protocol: upstream.protocol,
-        method: method.clone(),
-        url: url.clone(),
-        query: query.map(ToString::to_string),
-        api_key: api_key.clone(),
-        client_headers: client_headers.clone(),
-        derived_headers,
-        body,
-        mode,
-        conditional: false,
-        follow_redirects,
-    };
+    let mut url = upstream_url(&upstream.base_url, path, query);
+    let make =
+        |url: String, body: Bytes, derived_headers: HeaderMap, mode: ResponseMode| RequestPlan {
+            protocol: upstream.protocol,
+            method: method.clone(),
+            url,
+            query: query.map(ToString::to_string),
+            api_key: api_key.clone(),
+            client_headers: client_headers.clone(),
+            derived_headers,
+            body,
+            mode,
+            conditional: false,
+            follow_redirects,
+        };
     if upstream.protocol != Protocol::Codex && is_transparent(input, upstream_format) {
         debug!(target: "llmapi", path, "transparent proxy");
         let mut derived_headers = HeaderMap::new();
@@ -694,7 +823,7 @@ fn plan_generate(
                 HeaderValue::from_static("upstream_raw"),
             );
         }
-        return Ok(make(body.clone(), derived_headers, ResponseMode::Raw));
+        return Ok(make(url, body.clone(), derived_headers, ResponseMode::Raw));
     }
 
     debug!(target: "llmapi", ?input, ?upstream_format, "protocol adapter selected");
@@ -734,6 +863,22 @@ fn plan_generate(
             tools = llm_request.tools.len(),
             "normalized LLM request"
         );
+        if upstream_format == UpstreamFormat::Gemini {
+            url = gemini_generate_url(
+                &upstream.base_url,
+                &llm_request.model,
+                llm_request.stream,
+                query,
+            )
+            .map_err(|err| {
+                Box::new(protocol_error_response(
+                    &input,
+                    StatusCode::BAD_REQUEST,
+                    &err.to_string(),
+                    "invalid_request_error",
+                ))
+            })?;
+        }
         match llm_to_upstream(upstream_format, &llm_request) {
             Ok(value) => value,
             Err(err) => {
@@ -790,6 +935,7 @@ fn plan_generate(
         }
     };
     Ok(make(
+        url,
         Bytes::from(serde_json::to_vec(&upstream_json).unwrap()),
         derived_headers,
         mode,
@@ -827,10 +973,12 @@ async fn send_plan(
             headers.insert(header::IF_NONE_MATCH, etag.clone());
         }
     }
-    let client = if plan.follow_redirects {
-        &state.client
-    } else {
+    let client = if !plan.follow_redirects {
         &state.lb_client
+    } else if plan.protocol == Protocol::Gemini {
+        &state.gemini_client
+    } else {
+        &state.client
     };
     let request = client
         .request(plan.method.clone(), &plan.url)
@@ -849,10 +997,11 @@ async fn send_plan(
 async fn build_response(mode: ResponseMode, upstream: reqwest::Response) -> Response<Body> {
     match mode {
         ResponseMode::Models {
+            protocol,
             codex_client,
             allow_etag,
             models,
-        } => models_response(upstream, codex_client, allow_etag, &models).await,
+        } => models_response(upstream, protocol, codex_client, allow_etag, &models).await,
         ResponseMode::Raw | ResponseMode::RawUpstream => raw_upstream_response(upstream),
         ResponseMode::Converted {
             input,
@@ -1087,7 +1236,9 @@ fn input_to_llm(input: &InputFormat, value: Value) -> Result<LLMRequest, Adapter
         InputFormat::OpenAiChat => OpenAiChatAdapter::to_llm_request(value),
         InputFormat::OpenAiResponses => OpenAiResponsesAdapter::to_llm_request(value),
         InputFormat::AnthropicMessages => AnthropicAdapter::to_llm_request(value),
-        InputFormat::Models => unreachable!("models requests are forwarded before conversion"),
+        InputFormat::Models | InputFormat::GeminiInteractions => {
+            unreachable!("native requests are forwarded before conversion")
+        }
     }
 }
 
@@ -1096,7 +1247,43 @@ fn llm_to_upstream(upstream: UpstreamFormat, request: &LLMRequest) -> Result<Val
         UpstreamFormat::OpenAiChat => OpenAiChatAdapter::from_llm_request(request),
         UpstreamFormat::OpenAiResponses => OpenAiResponsesAdapter::from_llm_request(request),
         UpstreamFormat::AnthropicMessages => AnthropicAdapter::from_llm_request(request),
+        UpstreamFormat::Gemini => GeminiAdapter::from_llm_request(request),
     }
+}
+
+pub(crate) fn gemini_generate_url(
+    base_url: &str,
+    model: &str,
+    stream: bool,
+    query: Option<&str>,
+) -> Result<String, AdapterError> {
+    let model = model.strip_prefix("models/").unwrap_or(model);
+    if model.is_empty()
+        || !model
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err(AdapterError::InvalidField("model"));
+    }
+    if !stream {
+        return Ok(upstream_url(
+            base_url,
+            &format!("/models/{model}:generateContent"),
+            query,
+        ));
+    }
+    let mut stream_query = url::form_urlencoded::Serializer::new(String::new());
+    if let Some(query) = query {
+        stream_query.extend_pairs(
+            url::form_urlencoded::parse(query.as_bytes()).filter(|(key, _)| key != "alt"),
+        );
+    }
+    stream_query.append_pair("alt", "sse");
+    Ok(upstream_url(
+        base_url,
+        &format!("/models/{model}:streamGenerateContent"),
+        Some(&stream_query.finish()),
+    ))
 }
 
 pub(crate) fn upstream_url(base_url: &str, path: &str, query: Option<&str>) -> String {
@@ -1307,6 +1494,9 @@ fn protocol_error_response(
     error_type: &str,
 ) -> Response<Body> {
     let value = match input {
+        InputFormat::GeminiInteractions => json!({
+            "error": {"code": status.as_u16(), "message": message}
+        }),
         InputFormat::AnthropicMessages => json!({
             "type": "error",
             "error": {"type": error_type, "message": message}
@@ -1365,6 +1555,7 @@ fn upstream_to_llm(upstream: UpstreamFormat, value: Value) -> Result<LLMResponse
         UpstreamFormat::OpenAiChat => OpenAiChatAdapter::to_llm_response(value),
         UpstreamFormat::OpenAiResponses => OpenAiResponsesAdapter::to_llm_response(value),
         UpstreamFormat::AnthropicMessages => AnthropicAdapter::to_llm_response(value),
+        UpstreamFormat::Gemini => GeminiAdapter::to_llm_response(value),
     }
 }
 
@@ -1373,7 +1564,9 @@ fn llm_to_input(input: &InputFormat, response: &LLMResponse) -> Result<Value, Ad
         InputFormat::OpenAiChat => OpenAiChatAdapter::from_llm_response(response),
         InputFormat::OpenAiResponses => OpenAiResponsesAdapter::from_llm_response(response),
         InputFormat::AnthropicMessages => AnthropicAdapter::from_llm_response(response),
-        InputFormat::Models => unreachable!("models responses are forwarded before conversion"),
+        InputFormat::Models | InputFormat::GeminiInteractions => {
+            unreachable!("native responses are forwarded before conversion")
+        }
     }
 }
 
@@ -1386,6 +1579,7 @@ fn parse_stream_event(
         UpstreamFormat::OpenAiChat => OpenAiChatAdapter::parse_stream_event(event, state),
         UpstreamFormat::OpenAiResponses => OpenAiResponsesAdapter::parse_stream_event(event, state),
         UpstreamFormat::AnthropicMessages => AnthropicAdapter::parse_stream_event(event, state),
+        UpstreamFormat::Gemini => GeminiAdapter::parse_stream_event(event, state),
     }
 }
 
@@ -1398,7 +1592,9 @@ fn format_stream_events(
         InputFormat::OpenAiChat => OpenAiChatAdapter::format_stream_events(events, state),
         InputFormat::OpenAiResponses => OpenAiResponsesAdapter::format_stream_events(events, state),
         InputFormat::AnthropicMessages => AnthropicAdapter::format_stream_events(events, state),
-        InputFormat::Models => unreachable!("models responses are forwarded before conversion"),
+        InputFormat::Models | InputFormat::GeminiInteractions => {
+            unreachable!("native responses are forwarded before conversion")
+        }
     }
 }
 
