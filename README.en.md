@@ -43,7 +43,7 @@ or `http://127.0.0.1:8080/openai/v1` to select `openai` explicitly. See the
 
 ```bash
 llmapi list # aliases: ls, l
-llmapi check [provider] [--model <model>] [--timeout <seconds>]
+llmapi check [provider | --all | -a] [--model <model>] [--timeout <seconds>]
 llmapi completion [bash|elvish|fish|powershell|zsh] # alias: comp
 llmapi add <name> --type <chat|responses|messages|gemini|llmapi> --baseurl <url> [--apikey|--apikey-stdin] # alias: a
 llmapi add <name> --type lb --members <provider,provider>
@@ -53,6 +53,8 @@ llmapi server [--server 127.0.0.1:8080] [--default <provider>]
 llmapi daemon install [--workdir <path>] [--args server ...]
 llmapi daemon start|stop|restart|status|uninstall|remove
 ```
+
+Use `llmapi check -a` or `llmapi check --all` to check every provider in name order. Each provider gets its own `--timeout`. Checks continue after failures and the command exits with a nonzero status if any provider fails.
 
 `check` probes a provider without starting the server. It uses the provider
 named by the argument, or the configured default when omitted. Without

@@ -35,7 +35,7 @@ curl -H "Authorization: Bearer $LLMAPI_API_KEY" http://127.0.0.1:8080/providers
 
 ```bash
 llmapi list # 别名 ls、l
-llmapi check [provider] [--model <model>] [--timeout <seconds>]
+llmapi check [provider | --all | -a] [--model <model>] [--timeout <seconds>]
 llmapi completion [bash|elvish|fish|powershell|zsh] # 别名: comp
 llmapi add <name> --type <chat|responses|messages|gemini|llmapi> --baseurl <url> [--apikey|--apikey-stdin] # 别名 a
 llmapi add <name> --type lb --members <provider,provider>
@@ -45,6 +45,8 @@ llmapi server [--server 127.0.0.1:8080] [--default <provider>]
 llmapi daemon install [--workdir <path>] [--args server ...]
 llmapi daemon start|stop|restart|status|uninstall|remove
 ```
+
+使用 `llmapi check -a` 或 `llmapi check --all` 按名称顺序检查所有 provider。每个 provider 独立使用 `--timeout`；遇到失败会继续检查，最后以非零状态退出。
 
 `check` 在不启动服务的情况下探测 provider。使用参数指定的 provider；省略参数时使用配置的默认 provider。不带 `--model` 时请求 `GET /models` 并报告模型数量；带 `--model` 时改为发送一个最小补全请求。命令会输出 provider、状态、延迟和简短响应摘要，并在传输错误或非 2xx 响应时以非零状态退出。`--timeout` 默认 30 秒，是本次命令的总时间预算。对负载均衡 provider，`check` 从首成员开始按配置顺序探测，输出最终响应的成员和尝试次数，并使用与请求路由相同的失败分类。
 

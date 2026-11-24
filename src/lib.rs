@@ -54,7 +54,7 @@ enum Command {
     /// List configured providers
     #[command(visible_aliases = ["ls", "l"])]
     List,
-    /// Check that a provider is reachable
+    /// Check provider reachability
     Check(CheckArgs),
     /// Add a provider
     #[clap(visible_alias = "a")]
@@ -107,10 +107,13 @@ struct RemoveArgs {
 struct CheckArgs {
     /// Provider name (defaults to the configured default)
     provider: Option<String>,
+    /// Check every configured provider
+    #[arg(short, long, conflicts_with = "provider")]
+    all: bool,
     /// Send a minimal completion request with this model instead of listing models
     #[arg(long)]
     model: Option<String>,
-    /// Request timeout in seconds
+    /// Request timeout per provider in seconds
     #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..))]
     timeout: u64,
 }
@@ -212,15 +215,47 @@ impl Cmd {
         if config.providers.is_empty() {
             bail!("no providers configured");
         }
-        let (name, provider) = config.provider(args.provider.as_deref())?;
-        let (name, provider) = (name.to_owned(), provider.clone());
+        let check = |(name, provider)| {
+            Self::check_one_provider(
+                name,
+                provider,
+                &config,
+                codex_headers.as_ref(),
+                args,
+                lb_header_timeout,
+            )
+        };
+        if !args.all {
+            return check(config.provider(args.provider.as_deref())?).await;
+        }
+
+        let mut failures = Vec::new();
+        for (name, provider) in &config.providers {
+            if let Err(error) = check((name.as_str(), provider)).await {
+                failures.push(format!("{name}: {error:#}"));
+            }
+        }
+        if !failures.is_empty() {
+            bail!("{}", failures.join("\n"));
+        }
+        Ok(())
+    }
+
+    async fn check_one_provider(
+        name: &str,
+        provider: &ProviderConfig,
+        config: &Config,
+        codex_headers: Option<&HeaderMap>,
+        args: &CheckArgs,
+        lb_header_timeout: Duration,
+    ) -> Result<()> {
         let deadline = Instant::now() + Duration::from_secs(args.timeout);
         let probe = if args.model.is_some() {
             "model"
         } else {
             "models"
         };
-        match &provider {
+        match provider {
             ProviderConfig::Upstream(upstream) => {
                 let client = if upstream.protocol == Protocol::Gemini {
                     auth::gemini_http_client()
@@ -234,7 +269,7 @@ impl Cmd {
                 let outcome = probe_provider(
                     &client,
                     upstream,
-                    codex_headers.as_ref(),
+                    codex_headers,
                     args.model.as_deref(),
                     Some(timeout),
                 )
@@ -242,7 +277,7 @@ impl Cmd {
                 .with_context(|| format!("check provider {name}"))?;
                 print!(
                     "{}",
-                    format_check_report(&name, upstream.protocol.as_str(), probe, &outcome)
+                    format_check_report(name, upstream.protocol.as_str(), probe, &outcome)
                 );
                 if !outcome.status.is_success() {
                     bail!("provider {name} check failed: {}", outcome.status);
@@ -283,7 +318,7 @@ impl Cmd {
                     let probe = match send_probe(
                         &lb_client,
                         upstream,
-                        codex_headers.as_ref(),
+                        codex_headers,
                         args.model.as_deref(),
                         Some(remaining),
                         Some(header_timeout),
@@ -307,7 +342,7 @@ impl Cmd {
                     }
                     // Once headers are accepted, body/stream failures are final
                     // and must not be replayed against another member.
-                    let secrets = probe_secrets(upstream, codex_headers.as_ref());
+                    let secrets = probe_secrets(upstream, codex_headers);
                     let outcome = finish_probe(
                         probe,
                         upstream.protocol,
@@ -339,7 +374,7 @@ impl Cmd {
                     "member {} after {} attempt(s): {}",
                     member, attempts, outcome.detail
                 );
-                print!("{}", format_check_report(&name, "lb", probe, &outcome));
+                print!("{}", format_check_report(name, "lb", probe, &outcome));
                 if !outcome.status.is_success() {
                     bail!(
                         "load balancer {name} check failed: member {member} returned {}",
@@ -1049,6 +1084,7 @@ mod tests {
             Cmd::parse_from(["llmapi", "check"]).command,
             Command::Check(CheckArgs {
                 provider: None,
+                all: false,
                 model: None,
                 timeout: 30,
             })
@@ -1066,6 +1102,7 @@ mod tests {
             .command,
             Command::Check(CheckArgs {
                 provider: Some(_),
+                all: false,
                 model: Some(_),
                 timeout: 5,
             })
@@ -2020,6 +2057,42 @@ mod tests {
         };
         assert!(cmd.add(args).is_err());
         assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn check_all_reports_every_failed_provider() {
+        let upstream = spawn_upstream(Router::new().route(
+            "/models",
+            get(|| async { axum::http::StatusCode::UNAUTHORIZED }),
+        ))
+        .await;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("llmapi.yaml");
+        let mut config = Config::default();
+        config.injects.codex = false;
+        for name in ["first", "second"] {
+            config
+                .add_provider(
+                    name.into(),
+                    ProviderConfig::upstream(Protocol::OpenAiChat, upstream.clone(), None),
+                )
+                .unwrap();
+        }
+        config.save(&path).unwrap();
+        for flag in ["--all", "-a"] {
+            let cmd = Cmd::parse_from(["llmapi", "-c", path.to_str().unwrap(), "check", flag]);
+            let Command::Check(args) = &cmd.command else {
+                unreachable!()
+            };
+            let error = cmd.check(args).await.unwrap_err().to_string();
+            for name in ["first", "second"] {
+                assert!(
+                    error.contains(&format!("provider {name} check failed: 401")),
+                    "{error}"
+                );
+            }
+        }
+        assert!(Cmd::try_parse_from(["llmapi", "check", "--all", "first"]).is_err());
     }
 
     #[tokio::test]
