@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     env, fs,
-    path::Path,
+    path::{Path, PathBuf},
     str::FromStr,
 };
 
@@ -17,6 +17,8 @@ pub struct Config {
     pub server: String,
     #[serde(default, skip_serializing_if = "is_false")]
     pub access_log: bool,
+    #[serde(default, skip_serializing_if = "UsageDb::is_default")]
+    pub usage_db: UsageDb,
     #[serde(default, skip_serializing_if = "Injects::is_default")]
     pub injects: Injects,
     #[serde(
@@ -30,6 +32,56 @@ pub struct Config {
     pub default: String,
     #[serde(default)]
     pub providers: BTreeMap<String, ProviderConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct UsageDb {
+    setting: UsageDbSetting,
+    #[serde(skip)]
+    directory: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+enum UsageDbSetting {
+    Enabled(bool),
+    Path(PathBuf),
+}
+
+impl Default for UsageDb {
+    fn default() -> Self {
+        Self::from(true)
+    }
+}
+
+impl From<bool> for UsageDb {
+    fn from(enabled: bool) -> Self {
+        Self {
+            setting: UsageDbSetting::Enabled(enabled),
+            directory: PathBuf::new(),
+        }
+    }
+}
+
+impl UsageDb {
+    fn is_default(&self) -> bool {
+        self.setting == UsageDbSetting::Enabled(true)
+    }
+
+    pub fn path(&self) -> Option<PathBuf> {
+        match &self.setting {
+            UsageDbSetting::Enabled(false) => None,
+            UsageDbSetting::Enabled(true) => Some(self.directory.join("usage.db")),
+            UsageDbSetting::Path(path) => Some(self.directory.join(path)),
+        }
+    }
+
+    fn set_config_path(&mut self, path: &Path) {
+        if self.setting != UsageDbSetting::Enabled(false) {
+            self.directory = path.parent().unwrap_or(Path::new("")).to_owned();
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -166,6 +218,7 @@ impl Default for Config {
         Self {
             server: default_server(),
             access_log: false,
+            usage_db: UsageDb::default(),
             injects: Injects::default(),
             api_key: None,
             default: String::new(),
@@ -200,16 +253,20 @@ impl Config {
             Some(ext) => return Err(ConfigError::UnsupportedExtension(ext.to_string())),
             None => return Err(ConfigError::UnsupportedExtension(String::new())),
         };
+        config.usage_db.set_config_path(path);
         config.normalize();
         config.validate()?;
         Ok(config)
     }
 
     pub fn load_for_update(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
-        match Self::load(path.as_ref()) {
+        let path = path.as_ref();
+        match Self::load(path) {
             Ok(config) => Ok(config),
             Err(ConfigError::Read(err)) if err.kind() == std::io::ErrorKind::NotFound => {
-                Ok(Self::default())
+                let mut config = Self::default();
+                config.usage_db.set_config_path(path);
+                Ok(config)
             }
             Err(err) => Err(err),
         }
@@ -887,6 +944,40 @@ providers:
     }
 
     #[test]
+    fn usage_database_follows_config_location_and_survives_save() {
+        let dir = tempfile::tempdir().unwrap();
+        for ext in ["toml", "yaml", "json"] {
+            let path = dir.path().join(format!("config.{ext}"));
+            let mut config = Config::load_for_update(&path).unwrap();
+            assert_eq!(config.usage_db.path(), Some(dir.path().join("usage.db")));
+            for setting in ["false", "true", "custom.db"] {
+                let value = if setting.ends_with(".db") {
+                    format!("\"{setting}\"")
+                } else {
+                    setting.into()
+                };
+                let body = match ext {
+                    "toml" => format!("usage_db = {value}"),
+                    "yaml" => format!("usage_db: {value}"),
+                    _ => format!("{{\"usage_db\":{value}}}"),
+                };
+                config = Config::parse(&path, &body).unwrap();
+                let expected = match setting {
+                    "false" => None,
+                    "true" => Some(dir.path().join("usage.db")),
+                    other => Some(dir.path().join(other)),
+                };
+                assert_eq!(config.usage_db.path(), expected);
+                config.save(&path).unwrap();
+                assert_eq!(Config::load(&path).unwrap().usage_db.path(), expected);
+                assert!(!std::fs::read_to_string(&path)
+                    .unwrap()
+                    .contains(dir.path().to_str().unwrap()));
+            }
+        }
+    }
+
+    #[test]
     fn add_and_set_default_round_trip() {
         let dir = tempfile::tempdir().unwrap();
         for extension in ["yaml", "yml", "toml", "json"] {
@@ -929,7 +1020,7 @@ providers:
     #[test]
     fn lb_config_round_trips_in_every_format_and_preserves_order() {
         let dir = tempfile::tempdir().unwrap();
-        let mut base = Config::parse(Path::new("llmapi.yaml"), LB_YAML).unwrap();
+        let mut base = Config::parse(&dir.path().join("llmapi.yaml"), LB_YAML).unwrap();
         base.add_provider(
             "third".into(),
             ProviderConfig::upstream(Protocol::Anthropic, "https://third.test", None),

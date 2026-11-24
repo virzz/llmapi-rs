@@ -137,8 +137,8 @@ pub async fn handle_with_websocket(
                 "invalid_request_error",
             );
         }
-        let provider = match state.config.provider(route.provider.as_deref()) {
-            Ok((_, provider)) => provider.clone(),
+        let (name, provider) = match state.config.provider(route.provider.as_deref()) {
+            Ok((name, provider)) => (name.to_owned(), provider.clone()),
             Err(err) => {
                 return protocol_error_response(
                     &route.input,
@@ -170,7 +170,7 @@ pub async fn handle_with_websocket(
         let upstream = upstream.clone();
         let query = request.uri().query().map(ToString::to_string);
         return websocket
-            .on_upgrade(move |socket| proxy_websocket(state, headers, upstream, query, socket));
+            .on_upgrade(move |socket| proxy_websocket(state, name, headers, upstream, query, socket));
     }
     let expected_method = if route.input == InputFormat::Models {
         Method::GET
@@ -211,7 +211,16 @@ pub async fn handle_with_websocket(
             });
         let (path, endpoint) =
             interactions_endpoint(path).expect("interactions route contains a validated endpoint");
-        return proxy_interactions(&state, &provider, headers, request, path, endpoint).await;
+        return proxy_interactions(
+            &state,
+            &provider_name,
+            &provider,
+            headers,
+            request,
+            path,
+            endpoint,
+        )
+        .await;
     }
 
     if input == InputFormat::Models {
@@ -360,11 +369,14 @@ pub async fn handle_with_websocket(
         status = %upstream_response.status(),
         "upstream response received"
     );
+    let upstream_response =
+        crate::usage::observe(&state.usage, &provider_name, &body, upstream_response);
     build_response(plan.mode, upstream_response).await
 }
 
 async fn proxy_interactions(
     state: &AppState,
+    provider_name: &str,
     provider: &ProviderConfig,
     client_headers: HeaderMap,
     request: axum::http::Request<Body>,
@@ -453,7 +465,14 @@ async fn proxy_interactions(
         follow_redirects: false,
     };
     match send_plan(state, &plan, None).await {
-        Ok(upstream_response) => build_response(plan.mode, upstream_response).await,
+        Ok(upstream_response) => {
+            let response = if endpoint == InteractionsEndpoint::Create || plan.method == Method::GET {
+                crate::usage::observe_interaction(&state.usage, provider_name, &plan.body, upstream_response)
+            } else {
+                upstream_response
+            };
+            build_response(plan.mode, response).await
+        }
         Err(err) => send_error_response(&input, err, None),
     }
 }
@@ -480,6 +499,7 @@ fn send_error_response(
 
 async fn proxy_websocket(
     state: AppState,
+    name: String,
     headers: HeaderMap,
     upstream: UpstreamConfig,
     query: Option<String>,
@@ -554,6 +574,11 @@ async fn proxy_websocket(
             while let Some(message) = upstream_stream.next().await {
                 let Some(message) = message.ok() else { break };
                 let Some(message) = tungstenite_to_axum(message) else { break; };
+                match &message {
+                    AxumMessage::Text(text) => crate::usage::websocket(&state.usage, &name, text.as_bytes()),
+                    AxumMessage::Binary(bytes) => crate::usage::websocket(&state.usage, &name, bytes),
+                    _ => {}
+                }
                 if client_sink.send(message).await.is_err() { break; }
             }
         } => None,
@@ -1135,6 +1160,12 @@ async fn attempt_member(
         status = %upstream_response.status(),
         "load balancer member responded"
     );
+    let upstream_response = match request {
+        LbRequest::Generate { body, .. } => {
+            crate::usage::observe(&state.usage, member, body, upstream_response)
+        }
+        LbRequest::Models { .. } => upstream_response,
+    };
     Attempt::Response(build_response(plan.mode, upstream_response).await)
 }
 

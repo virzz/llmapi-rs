@@ -27,6 +27,7 @@ use super::{
 
 #[derive(Clone)]
 pub struct AppState {
+    pub(crate) usage: Option<Arc<crate::usage::Store>>,
     pub config: Arc<Config>,
     pub client: reqwest::Client,
     pub gemini_client: reqwest::Client,
@@ -42,6 +43,7 @@ pub struct AppState {
 
 /// One atomically published config version plus its load-balancer cursors.
 pub struct Runtime {
+    usage: Option<Arc<crate::usage::Store>>,
     pub config: Arc<Config>,
     pub lb: Arc<lb::State>,
     lb_header_timeout: Duration,
@@ -51,6 +53,11 @@ impl Runtime {
     fn new(config: Config) -> Self {
         let lb = Arc::new(lb::State::new(&config));
         Self {
+            usage: config
+                .usage_db
+                .path()
+                .map(crate::usage::Store::new)
+                .map(Arc::new),
             config: Arc::new(config),
             lb,
             lb_header_timeout: lb::ATTEMPT_HEADER_TIMEOUT,
@@ -59,11 +66,9 @@ impl Runtime {
 
     #[cfg(test)]
     fn with_lb_header_timeout(config: Config, lb_header_timeout: Duration) -> Self {
-        let lb = Arc::new(lb::State::new(&config));
         Self {
-            config: Arc::new(config),
-            lb,
             lb_header_timeout,
+            ..Self::new(config)
         }
     }
 }
@@ -91,6 +96,7 @@ impl ServerState {
             runtime.config.clone()
         };
         AppState {
+            usage: runtime.usage.clone(),
             config,
             client: self.client.clone(),
             gemini_client: self.gemini_client.clone(),
@@ -656,6 +662,7 @@ mod tests {
         Config {
             server: "127.0.0.1:0".into(),
             access_log: false,
+            usage_db: false.into(),
             injects: Default::default(),
             api_key: None,
             default: "deepseek".into(),
@@ -724,6 +731,120 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn usage_db_records_the_serving_member_before_response_conversion() {
+        let (upstream, _) = start_upstream(json!({
+            "model":"upstream-model", "choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],
+            "usage":{"prompt_tokens":7,"completion_tokens":3,"total_tokens":10}
+        })).await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("usage.db");
+        let mut config = test_config(&upstream);
+        config.usage_db = Default::default();
+        config
+            .providers
+            .insert("pool".into(), ProviderConfig::lb(vec!["deepseek".into()]));
+        let config_path = dir.path().join("config.toml");
+        config.save(&config_path).unwrap();
+        let runtime = Arc::new(Runtime::new(Config::load(config_path).unwrap()));
+        let usage = runtime.usage.clone().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app_with_auth(watch::channel(runtime).1, watch::channel(None).1),
+            )
+            .await
+            .unwrap();
+        });
+        let response = reqwest::Client::new()
+            .post(format!("http://{proxy}/pool/v1/responses"))
+            .json(&json!({"model":"alias","input":"ping"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.json::<Value>().await.unwrap()["usage"]["total_tokens"],
+            10
+        );
+        usage.flush().await;
+        let db = turso::Builder::new_local(path.to_str().unwrap())
+            .build()
+            .await
+            .unwrap();
+        let conn = db.connect().unwrap();
+        let mut rows = conn
+            .query("SELECT provider, model, total_tokens FROM token_usage", ())
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        assert_eq!(row.get::<String>(0).unwrap(), "deepseek");
+        assert_eq!(row.get::<String>(1).unwrap(), "upstream-model");
+        assert_eq!(row.get::<i64>(2).unwrap(), 10);
+        assert!(rows.next().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn interaction_usage_is_recorded_once_across_repeated_gets() {
+        let (upstream, _) = start_upstream(json!({
+            "id":"interaction_1", "model":"gemini", "status":"completed",
+            "usage":{"total_input_tokens":7,"total_output_tokens":3,"total_tokens":10}
+        }))
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut config = test_config(&upstream);
+        config.usage_db = true.into();
+        config.providers.insert(
+            "gemini".into(),
+            ProviderConfig::upstream(Protocol::Gemini, upstream, None),
+        );
+        config.save(&path).unwrap();
+        let runtime = Arc::new(Runtime::new(Config::load(&path).unwrap()));
+        let usage = runtime.usage.clone().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app_with_auth(watch::channel(runtime).1, watch::channel(None).1),
+            )
+            .await
+            .unwrap();
+        });
+        for _ in 0..2 {
+            let response = reqwest::Client::new()
+                .get(format!(
+                    "http://{proxy}/gemini/v1/interactions/interaction_1"
+                ))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.json::<Value>().await.unwrap()["usage"]["total_tokens"],
+                10
+            );
+        }
+        usage.flush().await;
+        let db = turso::Builder::new_local(dir.path().join("usage.db").to_str().unwrap())
+            .experimental_multiprocess_wal(true)
+            .read_only(true)
+            .build()
+            .await
+            .unwrap();
+        let connection = db.connect().unwrap();
+        let mut rows = connection
+            .query("SELECT count(*), sum(total_tokens) FROM token_usage", ())
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        assert_eq!(row.get::<i64>(0).unwrap(), 1);
+        assert_eq!(row.get::<i64>(1).unwrap(), 10);
+    }
+
+    #[tokio::test]
     async fn reloads_valid_config_and_keeps_last_good_on_invalid_change() {
         let (first_upstream, _) = start_upstream(json!({
             "object": "list", "data": [{"id": "first", "object": "model"}]
@@ -770,6 +891,7 @@ mod tests {
         let first: Value = list_models().send().await.unwrap().json().await.unwrap();
         assert_eq!(first["data"][0]["id"], "first");
 
+        config.usage_db = true.into();
         config.default = "openai".into();
         config.server = "127.0.0.1:9090".into();
         save_config_atomically(&config, &path);
@@ -777,6 +899,11 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        assert!(receiver.borrow().usage.is_some());
+        assert_eq!(
+            receiver.borrow().config.usage_db.path(),
+            Some(directory.path().join("usage.db"))
+        );
         assert_eq!(receiver.borrow().config.default, "openai");
         assert_eq!(receiver.borrow().config.server, "127.0.0.1:0");
         let second: Value = list_models().send().await.unwrap().json().await.unwrap();
@@ -800,12 +927,14 @@ mod tests {
         let still_second: Value = list_models().send().await.unwrap().json().await.unwrap();
         assert_eq!(still_second["data"][0]["id"], "second");
 
+        config.usage_db = false.into();
         config.default = "deepseek".into();
         save_config_atomically(&config, &path);
         tokio::time::timeout(Duration::from_secs(3), receiver.changed())
             .await
             .unwrap()
             .unwrap();
+        assert!(receiver.borrow().usage.is_none());
         let first_again: Value = list_models().send().await.unwrap().json().await.unwrap();
         assert_eq!(first_again["data"][0]["id"], "first");
         watcher.abort();
@@ -1101,6 +1230,7 @@ mod tests {
         remote.api_key = Some("remote-key".into());
         let remote = start_proxy(remote).await;
         let mut local = Config {
+            usage_db: false.into(),
             default: "relay".into(),
             api_key: Some("local-key".into()),
             ..Config::default()
@@ -1181,6 +1311,7 @@ mod tests {
         let (upstream, _) = start_upstream(catalog.clone()).await;
         let remote = start_proxy(test_config(&upstream)).await;
         let local = Config {
+            usage_db: false.into(),
             default: "relay".into(),
             providers: BTreeMap::from([(
                 "relay".into(),
@@ -1208,6 +1339,7 @@ mod tests {
         let (upstream, _) = start_stream_upstream(vec![stream.as_bytes().to_vec()]).await;
         let remote = start_proxy(test_config(&upstream)).await;
         let local = Config {
+            usage_db: false.into(),
             default: "relay".into(),
             providers: BTreeMap::from([(
                 "relay".into(),
@@ -1812,7 +1944,7 @@ mod tests {
             "usageMetadata": {"promptTokenCount": 3, "candidatesTokenCount": 1, "totalTokenCount": 4}
         })).await;
         let config: Config = serde_yaml::from_str(&format!(
-            "default: gemini\nproviders:\n  gemini:\n    type: gemini\n    baseurl: {upstream}/v1beta\n    apikey: gemini-upstream-key\n"
+            "usage_db: false\ndefault: gemini\nproviders:\n  gemini:\n    type: gemini\n    baseurl: {upstream}/v1beta\n    apikey: gemini-upstream-key\n"
         )).unwrap();
         let proxy = start_proxy(config).await;
         let client = reqwest::Client::new();
@@ -1925,7 +2057,7 @@ mod tests {
         let reply = json!({"id": "v1_test", "status": "in_progress", "steps": []});
         let (upstream, captured) = start_upstream(reply.clone()).await;
         let config: Config = serde_yaml::from_str(&format!(
-            "default: gemini\napikey: client-key\nproviders:\n  gemini:\n    type: gemini\n    baseurl: {upstream}/v1\n    apikey: upstream-key\n    models: [gemini-2.5-flash]\n"
+            "usage_db: false\ndefault: gemini\napikey: client-key\nproviders:\n  gemini:\n    type: gemini\n    baseurl: {upstream}/v1\n    apikey: upstream-key\n    models: [gemini-2.5-flash]\n"
         )).unwrap();
         let proxy = start_proxy(config).await;
         let client = reqwest::Client::new();

@@ -3,6 +3,7 @@ use crate::config::Injects;
 
 fn inject_codex_config() -> Config {
     Config {
+        usage_db: false.into(),
         injects: Injects { codex: true },
         ..Config::default()
     }

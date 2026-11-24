@@ -43,6 +43,7 @@ or `http://127.0.0.1:8080/openai/v1` to select `openai` explicitly. See the
 
 ```bash
 llmapi list # aliases: ls, l
+llmapi usage [--name <provider>] [--date <YYYY-MM-DD> | --date-range <START> <END>]
 llmapi check [provider | --all | -a] [--model <model>] [--timeout <seconds>]
 llmapi completion [bash|elvish|fish|powershell|zsh] # alias: comp
 llmapi add <name> --type <chat|responses|messages|gemini|llmapi> --baseurl <url> [--apikey|--apikey-stdin] # alias: a
@@ -159,6 +160,28 @@ OpenAI `data`. Missing metadata is synthesized when converting between formats.
 `GET /providers` returns the active default and all configured providers. Each
 configured `apikey` is returned as `***`; unset keys are omitted. The endpoint
 does not resolve environment variables or contact upstream providers.
+
+## Token usage
+
+Token usage recording is enabled by default. The first write creates `usage.db` beside the configuration file. Set the top-level `usage_db = false` to disable recording. A custom relative database path resolves against the configuration file’s directory.
+
+The server and the reporting CLI use Turso multiprocess WAL on a supported local filesystem. Each usage update commits atomically, and a report reads a consistent snapshot.
+
+The proxy records usage reported by the upstream under the serving provider and model. Cumulative streaming updates share one row. Missing counters remain SQL `NULL`. For OpenAI Chat streams, request usage with `stream_options.include_usage = true`.
+
+Usage snapshots are written asynchronously through a queue of 1024 entries. A full queue or a database write failure logs a warning and drops that snapshot. Pending snapshots can be lost when the process exits. Interaction creation, polling, and resumed streams share a record keyed by provider and interaction ID, with cumulative counters only increasing.
+
+```toml
+usage_db = false
+```
+
+Usage is grouped by provider and model. Names match providers exactly. Dates are in UTC and both range endpoints are inclusive.
+
+```sh
+llmapi usage
+llmapi usage --name gemini --date 2026-11-24
+llmapi usage --date-range 2026-11-01 2026-11-24
+```
 
 ## Gemini upstream
 

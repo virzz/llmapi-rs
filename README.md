@@ -35,6 +35,7 @@ curl -H "Authorization: Bearer $LLMAPI_API_KEY" http://127.0.0.1:8080/providers
 
 ```bash
 llmapi list # 别名 ls、l
+llmapi usage [--name <provider>] [--date <YYYY-MM-DD> | --date-range <START> <END>]
 llmapi check [provider | --all | -a] [--model <model>] [--timeout <seconds>]
 llmapi completion [bash|elvish|fish|powershell|zsh] # 别名: comp
 llmapi add <name> --type <chat|responses|messages|gemini|llmapi> --baseurl <url> [--apikey|--apikey-stdin] # 别名 a
@@ -96,6 +97,28 @@ journalctl --user -u llmapi.service -f
 `GET /models` 和 `GET /v1/models`（也支持 `/{provider}` 前缀）接受上游 OpenAI `data` 或 Codex `models` 列表，并按所选 provider 的模型限制过滤。Codex 请求（通过 `client_version` 或 Codex User-Agent 识别）收到 `models`；其他客户端收到 OpenAI `data`。格式转换时会补齐缺失的元数据。
 
 `GET /providers` 返回当前默认 provider 和所有已配置 provider。每个已配置的 `apikey` 返回为 `***`；未设置的密钥会被省略。该端点不会展开环境变量，也不会联系上游 provider。
+
+## Token 用量
+
+默认启用本地 Turso 用量记录，首次写入时在配置文件所在目录创建 `usage.db`。要关闭记录，在配置文件顶层设置 `usage_db = false`。也可指定其他数据库路径，相对路径以配置文件所在目录为基准。
+
+服务和查询命令通过 Turso 多进程 WAL 协调同一数据库的访问。每次用量更新原子提交，查询读取一致快照。数据库应放在支持共享 WAL 的本地文件系统上。
+
+代理按实际处理请求的 provider 和模型记录上游报告的用量。流式响应的累计值更新到同一条记录，缺失的计数保留为 SQL `NULL`。OpenAI Chat 流式请求可以设置 `stream_options.include_usage = true` 获取用量。
+
+用量快照通过容量为 1024 的后台队列异步写入。队列满或数据库写入失败时会记录警告并丢弃该快照；进程退出时尚未写入的快照可能丢失。Interactions 的创建、轮询和续读按 provider 与 interaction ID 去重，累计计数只向上更新。
+
+```toml
+usage_db = false
+```
+
+按 provider 和模型汇总。名称精确匹配 provider，日期使用 UTC，范围包含起止两天。
+
+```sh
+llmapi usage
+llmapi usage --name gemini --date 2026-11-24
+llmapi usage --date-range 2026-11-01 2026-11-24
+```
 
 ## Gemini 上游
 

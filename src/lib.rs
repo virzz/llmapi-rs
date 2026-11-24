@@ -15,6 +15,7 @@ pub mod protocol;
 pub mod proxy;
 mod redact;
 pub mod server;
+mod usage;
 
 use std::{
     io::{self, IsTerminal},
@@ -56,6 +57,8 @@ enum Command {
     List,
     /// Check provider reachability
     Check(CheckArgs),
+    /// Show recorded token usage by provider and model
+    Usage(usage::UsageArgs),
     /// Add a provider
     #[clap(visible_alias = "a")]
     Add(AddArgs),
@@ -501,6 +504,12 @@ impl Cmd {
             }
             Command::List => self.list(),
             Command::Check(args) => self.check(args).await,
+            Command::Usage(args) => {
+                let config = self.load_config()?;
+                let path = config.usage_db.path().context("usage recording is disabled in the configuration")?;
+                println!("{}", args.report(&path).await?);
+                Ok(())
+            }
             Command::Add(args) => self.add(args),
             Command::Remove(args) => self.remove(args),
             Command::Set(args) => self.set(args),
@@ -1297,6 +1306,7 @@ mod tests {
         let config = Config {
             server: "127.0.0.1:8080".into(),
             access_log: false,
+            usage_db: Default::default(),
             injects: Default::default(),
             api_key: None,
             default: "deepseek".into(),
@@ -1343,6 +1353,7 @@ mod tests {
         let mut config = Config {
             server: "127.0.0.1:8080".into(),
             access_log: false,
+            usage_db: Default::default(),
             injects: Default::default(),
             api_key: None,
             default: "deepseek".into(),

@@ -81,7 +81,10 @@ async fn chat_member(text: &str) -> (String, Counter) {
 }
 
 fn config_with(members: &[&str], upstreams: &[(&str, &str, Protocol)]) -> Config {
-    let mut config = Config::default();
+    let mut config = Config {
+        usage_db: false.into(),
+        ..Config::default()
+    };
     for (name, url, protocol) in upstreams {
         config.providers.insert(
             (*name).into(),
