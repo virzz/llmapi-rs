@@ -2031,7 +2031,7 @@ mod tests {
         let response = reqwest::Client::new()
             .post(format!("http://{proxy}/gemini/v1/chat/completions?alt=json&key=ignored"))
             .header("x-goog-api-key", "gemini-client-key")
-            .json(&json!({"model": "models/gemini-2.5-flash", "messages": [{"role": "user", "content": "ping"}], "stream": true}))
+            .json(&json!({"model": "models/gemini-2.5-flash", "messages": [{"role": "user", "content": "ping"}], "stream": true, "stream_options": {"include_usage": true}}))
             .send().await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.headers()["content-type"], "text/event-stream");
@@ -2052,6 +2052,232 @@ mod tests {
         );
         assert_eq!(request.headers["x-goog-api-key"], "gemini-client-key");
         assert!(request.body.get("stream").is_none());
+    }
+
+    #[tokio::test]
+    async fn gemini_rejects_disabled_parallel_tools_before_contacting_upstream() {
+        let (upstream, captured) = start_upstream(json!({})).await;
+        let mut config = test_config(&upstream);
+        config.providers.insert(
+            "gemini".into(),
+            ProviderConfig::upstream(Protocol::Gemini, upstream, None),
+        );
+        let proxy = start_proxy(config).await;
+        let function = json!({"name":"lookup","parameters":{"type":"object"}});
+        let client = reqwest::Client::new();
+        for (path, body) in [
+            (
+                "chat/completions",
+                json!({
+                    "model":"gemini","messages":[{"role":"user","content":"ping"}],
+                    "tools":[{"type":"function","function":function}],"parallel_tool_calls":false
+                }),
+            ),
+            (
+                "responses",
+                json!({
+                    "model":"gemini","input":"ping",
+                    "tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}],
+                    "parallel_tool_calls":false
+                }),
+            ),
+            (
+                "messages",
+                json!({
+                    "model":"gemini","max_tokens":32,"messages":[{"role":"user","content":"ping"}],
+                    "tools":[{"name":"lookup","input_schema":{"type":"object"}}],
+                    "tool_choice":{"type":"auto","disable_parallel_tool_use":true}
+                }),
+            ),
+        ] {
+            let reply = client
+                .post(format!("http://{proxy}/gemini/v1/{path}"))
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(reply.status(), StatusCode::BAD_REQUEST, "{path}");
+            assert!(
+                reply.text().await.unwrap().contains("parallel_tool_calls"),
+                "{path}"
+            );
+        }
+        assert!(captured.lock().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn gemini_orders_parallel_tool_results_within_each_turn() {
+        let (upstream, captured) = start_upstream(json!({
+            "candidates":[{"content":{"parts":[{"text":"pong"}]},"finishReason":"STOP"}]
+        }))
+        .await;
+        let mut config = test_config(&upstream);
+        config.providers.insert(
+            "gemini".into(),
+            ProviderConfig::upstream(Protocol::Gemini, upstream, None),
+        );
+        let proxy = start_proxy(config).await;
+        let call = |id: &str, key: &str| {
+            json!({"type":"function","id":id,
+            "function":{"name":"lookup","arguments":json!({"key":key}).to_string()}})
+        };
+        let result = |id: &str, found: &str| json!({"role":"tool","tool_call_id":id,"content": json!({"found":found}).to_string()});
+        let mut signed = call("call_A", "A");
+        signed["extra_content"] = json!({"google":{"thought_signature":"c2ln"}});
+        let reply = reqwest::Client::new()
+            .post(format!("http://{proxy}/gemini/v1/chat/completions"))
+            .json(&json!({"model":"gemini", "messages":[
+                {"role":"user","content":"look up A and B"},
+                {"role":"assistant","tool_calls":[signed,call("call_B","B")]},
+                result("call_B","B"), result("call_A","A"),
+                {"role":"assistant","tool_calls":[call("call_C","C")]}, result("call_C","C"),
+            ]}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(reply.status(), StatusCode::OK);
+        let request = captured.lock().await.take().unwrap();
+        let contents = request.body["contents"].as_array().unwrap();
+        assert_eq!(contents.len(), 5);
+        assert_eq!(contents[1]["parts"][0]["functionCall"]["id"], "call_A");
+        assert_eq!(contents[1]["parts"][0]["thoughtSignature"], "c2ln");
+        assert_eq!(contents[1]["parts"][1]["functionCall"]["id"], "call_B");
+        assert!(contents[1]["parts"][1].get("thoughtSignature").is_none());
+        assert_eq!(
+            contents[2],
+            json!({"role":"user","parts":[
+                {"functionResponse":{"id":"call_A","name":"lookup","response":{"found":"A"}}},
+                {"functionResponse":{"id":"call_B","name":"lookup","response":{"found":"B"}}}
+            ]})
+        );
+        assert_eq!(contents[3]["parts"][0]["functionCall"]["id"], "call_C");
+        assert_eq!(contents[4]["parts"][0]["functionResponse"]["id"], "call_C");
+    }
+
+    #[tokio::test]
+    async fn gemini_groups_responses_function_items_and_preserves_call_order() {
+        let (upstream, captured) = start_upstream(json!({
+            "candidates":[{"content":{"parts":[{"text":"pong"}]},"finishReason":"STOP"}]
+        }))
+        .await;
+        let mut config = test_config(&upstream);
+        config.providers.insert(
+            "gemini".into(),
+            ProviderConfig::upstream(Protocol::Gemini, upstream, None),
+        );
+        let proxy = start_proxy(config).await;
+        let reply = reqwest::Client::new()
+            .post(format!("http://{proxy}/gemini/v1/responses"))
+            .json(&json!({"model":"gemini","input":[
+                {"role":"user","content":"look up A and B"},
+                {"type":"function_call","name":"lookup","call_id":"a","arguments":"{\"key\":\"A\"}",
+                 "extra_content":{"google":{"thought_signature":"c2ln"}}},
+                {"type":"function_call","name":"lookup","call_id":"b","arguments":"{\"key\":\"B\"}"},
+                {"type":"function_call_output","call_id":"b","output":"{\"found\":\"B\"}"},
+                {"type":"function_call_output","call_id":"a","output":"{\"found\":\"A\"}"},
+            ]})).send().await.unwrap();
+        assert_eq!(reply.status(), StatusCode::OK);
+        let request = captured.lock().await.take().unwrap();
+        let contents = request.body["contents"].as_array().unwrap();
+        assert_eq!(contents.len(), 3);
+        assert_eq!(
+            contents[1],
+            json!({"role":"model","parts":[
+                {"functionCall":{"id":"a","name":"lookup","args":{"key":"A"}},"thoughtSignature":"c2ln"},
+                {"functionCall":{"id":"b","name":"lookup","args":{"key":"B"}}}
+            ]})
+        );
+        assert_eq!(
+            contents[2],
+            json!({"role":"user","parts":[
+                {"functionResponse":{"id":"a","name":"lookup","response":{"found":"A"}}},
+                {"functionResponse":{"id":"b","name":"lookup","response":{"found":"B"}}}
+            ]})
+        );
+    }
+
+    #[tokio::test]
+    async fn gemini_chat_stream_respects_usage_opt_in_and_late_accounting() {
+        let client = reqwest::Client::new();
+        for terminal in ["combined", "late", "missing", "error"] {
+            let usage =
+                json!({"promptTokenCount": 3, "candidatesTokenCount": 2, "totalTokenCount": 5});
+            let mut frames = vec![
+                json!({"candidates":[{"content":{"parts":[{"text":"pong"}]}}]}),
+                json!({"candidates":[{"finishReason":"STOP"}]}),
+            ];
+            match terminal {
+                "combined" => frames[1]["usageMetadata"] = usage,
+                "late" => frames.push(json!({"usageMetadata":usage})),
+                "error" => frames.push(json!({"error":{"message":"stream failed"}})),
+                _ => {}
+            }
+            let chunks = frames
+                .into_iter()
+                .map(|frame| format!("data: {frame}\n\n").into_bytes())
+                .collect();
+            let (upstream, _) = start_stream_upstream(chunks).await;
+            let mut config = test_config(&upstream);
+            config.providers.insert(
+                "gemini".into(),
+                ProviderConfig::upstream(Protocol::Gemini, upstream, None),
+            );
+            let proxy = start_proxy(config).await;
+            for include in [Some(true), Some(false), None] {
+                let mut body = json!({"model":"gemini","stream":true,"messages":[{"role":"user","content":"ping"}]});
+                if let Some(include) = include {
+                    body["stream_options"] = json!({"include_usage":include});
+                }
+                let reply = client
+                    .post(format!("http://{proxy}/gemini/v1/chat/completions"))
+                    .json(&body)
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(reply.status(), StatusCode::OK);
+                let wire = reply.text().await.unwrap();
+                let events = sse_json_events(&wire);
+                assert!(
+                    events
+                        .iter()
+                        .any(|e| e["choices"][0]["delta"]["content"] == "pong")
+                );
+                let done = wire.matches("data: [DONE]").count();
+                if terminal == "error" {
+                    assert_eq!(done, 0);
+                    assert_eq!(events.last().unwrap()["error"]["message"], "stream failed");
+                    continue;
+                }
+                assert_eq!(done, 1, "{terminal}, {include:?}");
+                assert!(wire.ends_with("data: [DONE]\n\n"));
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|e| e["choices"][0]["finish_reason"] == "stop")
+                        .count(),
+                    1
+                );
+                if include == Some(true) {
+                    let expected = terminal != "missing";
+                    let last = events.last().unwrap();
+                    assert_eq!(
+                        last.get("usage").is_some_and(|usage| usage.is_object()),
+                        expected
+                    );
+                    if expected {
+                        assert_eq!(last["usage"]["total_tokens"], 5);
+                        assert_eq!(last["choices"], json!([]));
+                    }
+                    assert!(
+                        events[..events.len() - usize::from(expected)]
+                            .iter()
+                            .all(|e| e.get("usage") == Some(&Value::Null))
+                    );
+                } else {
+                    assert!(events.iter().all(|e| e.get("usage").is_none()));
+                }
+            }
+        }
     }
 
     #[tokio::test]

@@ -124,6 +124,8 @@ llmapi usage --date-range 2026-11-01 2026-11-24
 
 协议转换不支持的非默认参数（例如 Chat `n: 2`、`seed`、`logprobs: true`）返回 `400`。Chat `reasoning_effort`、Responses `reasoning` 和 Messages `thinking` / `output_config.effort` 暂不转换为 Gemini 思考设置；提供非空设置时返回 `400`。省略这些设置时使用模型默认值。原生 Interactions 请求不受此转换限制。
 
+启用工具时，Chat / Responses 的 `parallel_tool_calls: false` 和 Messages 的 `disable_parallel_tool_use: true` 会返回 `400`，因为 Gemini 无法保证每轮最多调用一次。在 Chat 流式响应中，仅当 `stream_options.include_usage: true` 时才会在 `[DONE]` 前返回上游提供的用量。
+
 工具调用中的 Gemini `thoughtSignature` 通过 Chat、Responses 和 Messages 输出项上的 `extra_content.google.thought_signature` 往返传递。客户端回传工具调用历史时需保留该扩展字段。
 
 ```toml

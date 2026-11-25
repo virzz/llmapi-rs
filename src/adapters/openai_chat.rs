@@ -479,6 +479,25 @@ impl StreamAdapter for OpenAiChatAdapter {
         events: &[LLMStreamEvent],
         state: &mut StreamState,
     ) -> Result<Vec<SseEvent>, AdapterError> {
+        Self::format_stream_events_with_usage(events, state, None)
+    }
+}
+
+impl OpenAiChatAdapter {
+    pub(crate) fn format_stream_events_with_usage(
+        events: &[LLMStreamEvent],
+        state: &mut StreamState,
+        include_usage: Option<bool>,
+    ) -> Result<Vec<SseEvent>, AdapterError> {
+        let chunk = |state: &StreamState, delta, finish_reason, usage| {
+            chat_stream_event(
+                state,
+                delta,
+                finish_reason,
+                usage,
+                include_usage == Some(true),
+            )
+        };
         let mut output = Vec::new();
         for event in events {
             match event {
@@ -488,7 +507,7 @@ impl StreamAdapter for OpenAiChatAdapter {
                         .or_else(|| Some(format!("chatcmpl_{}", uuid::Uuid::new_v4())));
                     state.model = model.clone();
                     state.started = true;
-                    output.push(chat_stream_event(
+                    output.push(chunk(
                         state,
                         json!({"role": "assistant", "content": ""}),
                         None,
@@ -504,20 +523,12 @@ impl StreamAdapter for OpenAiChatAdapter {
                             call["id"] = json!(format!("call_{}", uuid::Uuid::new_v4()));
                         }
                         super::add_tool_call_extra_content(&mut call, content);
-                        output.push(chat_stream_event(
-                            state,
-                            json!({"tool_calls": [call]}),
-                            None,
-                            None,
-                        ));
+                        output.push(chunk(state, json!({"tool_calls": [call]}), None, None));
                     }
                 }
-                LLMStreamEvent::TextDelta { text, .. } => output.push(chat_stream_event(
-                    state,
-                    json!({"content": text}),
-                    None,
-                    None,
-                )),
+                LLMStreamEvent::TextDelta { text, .. } => {
+                    output.push(chunk(state, json!({"content": text}), None, None))
+                }
                 LLMStreamEvent::ReasoningDelta {
                     text, signature, ..
                 } => {
@@ -528,17 +539,14 @@ impl StreamAdapter for OpenAiChatAdapter {
                     if let Some(signature) = signature {
                         delta.insert("reasoning_signature".into(), json!(signature));
                     }
-                    output.push(chat_stream_event(state, Value::Object(delta), None, None));
+                    output.push(chunk(state, Value::Object(delta), None, None));
                 }
-                LLMStreamEvent::RefusalDelta { refusal, .. } => output.push(chat_stream_event(
-                    state,
-                    json!({"refusal": refusal}),
-                    None,
-                    None,
-                )),
+                LLMStreamEvent::RefusalDelta { refusal, .. } => {
+                    output.push(chunk(state, json!({"refusal": refusal}), None, None))
+                }
                 LLMStreamEvent::AnnotationAdded { annotation, .. } => {
                     let annotation = annotation_to_openai(annotation, LLMProtocol::OpenAiChat)?;
-                    output.push(chat_stream_event(
+                    output.push(chunk(
                         state,
                         json!({"annotations": [annotation]}),
                         None,
@@ -559,12 +567,7 @@ impl StreamAdapter for OpenAiChatAdapter {
                     if let Some(name) = name {
                         call["function"]["name"] = json!(name);
                     }
-                    output.push(chat_stream_event(
-                        state,
-                        json!({"tool_calls": [call]}),
-                        None,
-                        None,
-                    ));
+                    output.push(chunk(state, json!({"tool_calls": [call]}), None, None));
                 }
                 LLMStreamEvent::ContentEnd { index } => {
                     if let Some(target) = state.content_indices.get(index) {
@@ -580,14 +583,16 @@ impl StreamAdapter for OpenAiChatAdapter {
                     if let Some(usage) = usage {
                         state.usage = Some(usage.clone());
                     }
-                    output.push(chat_stream_event(
+                    output.push(chunk(
                         state,
                         json!({}),
                         finish_reason.map(chat_finish_reason_to_value),
                         None,
                     ));
-                    if let Some(usage) = &state.usage {
-                        output.push(chat_stream_event(
+                    if include_usage != Some(false)
+                        && let Some(usage) = &state.usage
+                    {
+                        output.push(chunk(
                             state,
                             json!({}),
                             None,
@@ -1342,6 +1347,7 @@ fn chat_stream_event(
     delta: Value,
     finish_reason: Option<Value>,
     usage: Option<Value>,
+    explicit_usage: bool,
 ) -> SseEvent {
     let choices = if usage.is_some()
         && delta.as_object().is_some_and(Map::is_empty)
@@ -1354,6 +1360,8 @@ fn chat_stream_event(
     let mut value = json!({"id": state.id, "object": "chat.completion.chunk", "created": Utc::now().timestamp(), "model": state.model, "choices": choices});
     if let Some(usage) = usage {
         value["usage"] = usage;
+    } else if explicit_usage {
+        value["usage"] = Value::Null;
     }
     SseEvent::json(None, &value)
 }

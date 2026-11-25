@@ -18,7 +18,7 @@ use super::{
     auth, codex,
     config::{Protocol, ProviderConfig, UpstreamConfig},
     lb,
-    model::{LLMRequest, LLMResponse},
+    model::{LLMFinishReason, LLMRequest, LLMResponse, LLMStreamEvent},
     models,
     protocol::{
         detect_route, interactions_endpoint, is_transparent, upstream_for_input, InputFormat,
@@ -47,6 +47,7 @@ enum ResponseMode {
     Converted {
         input: InputFormat,
         upstream: UpstreamFormat,
+        gemini_chat_usage: Option<bool>,
     },
     Codex {
         input: InputFormat,
@@ -865,6 +866,13 @@ fn plan_generate(
     };
     let is_codex = upstream.protocol == Protocol::Codex;
     let client_stream = input_json["stream"].as_bool().unwrap_or(false);
+    let gemini_chat_usage = (input == InputFormat::OpenAiChat
+        && upstream_format == UpstreamFormat::Gemini)
+        .then(|| {
+            input_json["stream_options"]["include_usage"]
+                .as_bool()
+                .unwrap_or(false)
+        });
     let mut upstream_json = if is_codex && input == InputFormat::OpenAiResponses {
         input_json
     } else {
@@ -955,6 +963,7 @@ fn plan_generate(
         ResponseMode::Converted {
             input,
             upstream: upstream_format,
+            gemini_chat_usage,
         }
     };
     Ok(make(
@@ -1029,7 +1038,8 @@ async fn build_response(mode: ResponseMode, upstream: reqwest::Response) -> Resp
         ResponseMode::Converted {
             input,
             upstream: format,
-        } => convert_response_back(upstream, &input, format).await,
+            gemini_chat_usage,
+        } => convert_response_back(upstream, &input, format, gemini_chat_usage).await,
         ResponseMode::Codex { input, stream } => codex_response(upstream, &input, stream).await,
     }
 }
@@ -1188,7 +1198,7 @@ async fn codex_response(
         return if *input == InputFormat::OpenAiResponses {
             raw_upstream_response(upstream)
         } else {
-            converted_sse_response(upstream, *input, UpstreamFormat::OpenAiResponses)
+            converted_sse_response(upstream, *input, UpstreamFormat::OpenAiResponses, None)
         };
     }
     let headers = upstream.headers().clone();
@@ -1355,6 +1365,7 @@ async fn convert_response_back(
     upstream_response: reqwest::Response,
     input: &InputFormat,
     upstream: UpstreamFormat,
+    gemini_chat_usage: Option<bool>,
 ) -> Response<Body> {
     let status = upstream_response.status();
     let content_type = upstream_response
@@ -1369,7 +1380,7 @@ async fn convert_response_back(
     }
 
     if content_type.contains("text/event-stream") {
-        return converted_sse_response(upstream_response, *input, upstream);
+        return converted_sse_response(upstream_response, *input, upstream, gemini_chat_usage);
     }
 
     let body = match read_upstream_body(upstream_response, MAX_JSON_BODY_BYTES).await {
@@ -1631,6 +1642,7 @@ fn converted_sse_response(
     upstream_response: reqwest::Response,
     input: InputFormat,
     upstream: UpstreamFormat,
+    gemini_chat_usage: Option<bool>,
 ) -> Response<Body> {
     let upstream_headers = upstream_response.headers().clone();
     let stream = upstream_response.bytes_stream();
@@ -1639,6 +1651,7 @@ fn converted_sse_response(
         let mut decoder = SseDecoder::default();
         let mut source_state = StreamState::default();
         let mut target_state = StreamState::default();
+        let mut chat_terminal = GeminiChatTerminal::new(gemini_chat_usage);
         while let Some(chunk) = stream.next().await {
             let chunk = match chunk {
                 Ok(chunk) => chunk,
@@ -1661,7 +1674,7 @@ fn converted_sse_response(
                 }
             };
             for event in events {
-                match convert_sse_event(&event, &input, upstream, &mut source_state, &mut target_state) {
+                match convert_sse_event(&event, &input, upstream, &mut source_state, &mut target_state, &mut chat_terminal) {
                     Ok(outputs) => for output in outputs {
                         yield Ok::<Bytes, std::io::Error>(Bytes::from(output.encode()));
                     },
@@ -1677,7 +1690,7 @@ fn converted_sse_response(
         }
         match decoder.finish() {
             Ok(events) => for event in events {
-                match convert_sse_event(&event, &input, upstream, &mut source_state, &mut target_state) {
+                match convert_sse_event(&event, &input, upstream, &mut source_state, &mut target_state, &mut chat_terminal) {
                     Ok(outputs) => for output in outputs {
                         yield Ok::<Bytes, std::io::Error>(Bytes::from(output.encode()));
                     },
@@ -1696,7 +1709,23 @@ fn converted_sse_response(
                 return;
             }
         }
-        if !source_state.ended {
+        if let Some(finish_reason) = chat_terminal.pending {
+            let terminal = LLMStreamEvent::MessageEnd {
+                finish_reason: Some(finish_reason),
+                usage: None,
+                metadata: Default::default(),
+            };
+            match OpenAiChatAdapter::format_stream_events_with_usage(
+                &[terminal], &mut target_state, chat_terminal.include_usage,
+            ) {
+                Ok(outputs) => for output in outputs {
+                    yield Ok::<Bytes, std::io::Error>(Bytes::from(output.encode()));
+                },
+                Err(err) => for output in stream_error_events(&input, &mut target_state, err.to_string()) {
+                    yield Ok::<Bytes, std::io::Error>(Bytes::from(output.encode()));
+                },
+            }
+        } else if !source_state.ended && !chat_terminal.failed {
             for output in stream_error_events(&input, &mut target_state, "upstream stream ended before a terminal event".into()) {
                 yield Ok::<Bytes, std::io::Error>(Bytes::from(output.encode()));
             }
@@ -1714,15 +1743,62 @@ fn converted_sse_response(
     response
 }
 
+struct GeminiChatTerminal {
+    include_usage: Option<bool>,
+    pending: Option<LLMFinishReason>,
+    failed: bool,
+}
+
+impl GeminiChatTerminal {
+    fn new(include_usage: Option<bool>) -> Self {
+        Self {
+            include_usage,
+            pending: None,
+            failed: false,
+        }
+    }
+
+    fn format(
+        &mut self,
+        mut events: Vec<LLMStreamEvent>,
+        state: &mut StreamState,
+    ) -> Result<Vec<SseEvent>, AdapterError> {
+        if self.failed {
+            return Ok(Vec::new());
+        }
+        // Gemini may send its final accounting in a later SSE event than finishReason.
+        // Drain accounting before [DONE] even on opt-out; clients can close at [DONE].
+        // Content deltas are still forwarded immediately.
+        events.retain(|event| match event {
+            LLMStreamEvent::MessageEnd { finish_reason, .. } => {
+                self.pending = *finish_reason;
+                false
+            }
+            LLMStreamEvent::Error { .. } => {
+                self.pending = None;
+                self.failed = true;
+                true
+            }
+            _ => true,
+        });
+        OpenAiChatAdapter::format_stream_events_with_usage(&events, state, self.include_usage)
+    }
+}
+
 fn convert_sse_event(
     event: &SseEvent,
     input: &InputFormat,
     upstream: UpstreamFormat,
     source_state: &mut StreamState,
     target_state: &mut StreamState,
+    chat_terminal: &mut GeminiChatTerminal,
 ) -> Result<Vec<SseEvent>, AdapterError> {
     let events = parse_stream_event(upstream, event, source_state)?;
-    format_stream_events(input, &events, target_state)
+    if chat_terminal.include_usage.is_some() {
+        chat_terminal.format(events, target_state)
+    } else {
+        format_stream_events(input, &events, target_state)
+    }
 }
 
 fn stream_error_events(

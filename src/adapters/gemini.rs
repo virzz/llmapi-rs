@@ -98,7 +98,15 @@ impl RequestAdapter for GeminiAdapter {
             }
         }
         if request.source != GEMINI {
-            // Gemini always reports stream usage; this client option needs no upstream field.
+            if request.parallel_tool_calls == Some(false)
+                && !request.tools.is_empty()
+                && !matches!(request.tool_choice, Some(LLMToolChoice::None))
+            {
+                return Err(AdapterError::Unsupported(
+                    "Gemini cannot preserve parallel_tool_calls: false with tools enabled".into(),
+                ));
+            }
+            // The proxy handles Chat usage delivery without an upstream request field.
             validate_request_extras(request, GEMINI, &[], &[], &["stream_options"])?;
             if request.reasoning.as_ref().is_some_and(|reasoning| {
                 !reasoning.is_null() && !reasoning.as_object().is_some_and(Extensions::is_empty)
@@ -215,9 +223,36 @@ fn message_from_value(value: &Value, role: LLMRole) -> Result<LLMMessage, Adapte
 fn messages_to_value(messages: &[LLMMessage]) -> Result<(Option<Value>, Vec<Value>), AdapterError> {
     let mut system: Option<Extensions> = None;
     let mut system_parts = Vec::new();
-    let mut contents = Vec::new();
+    let mut contents = Vec::<Value>::new();
     let mut calls = BTreeMap::new();
-    for message in messages {
+    let mut call_order = BTreeMap::new();
+    let mut next_call = 0;
+    let mut previous_responses_call = false;
+    let mut messages = messages.iter().peekable();
+    while let Some(message) = messages.next() {
+        if is_openai_tool_result(message) {
+            let mut parts = Vec::new();
+            let mut current = message;
+            loop {
+                for content in &current.content {
+                    if let LLMContentKind::ToolResult { tool_call_id, .. } = &content.kind {
+                        let part = part_to_value(content, &calls)?;
+                        parts.push((call_order.get(tool_call_id.as_str()).copied(), part));
+                    }
+                }
+                match messages.next_if(|next| is_openai_tool_result(next)) {
+                    Some(next) => current = next,
+                    None => break,
+                }
+            }
+            // Same-name calls without provider IDs are paired positionally.
+            parts.sort_by_key(|(index, _)| *index);
+            let parts = parts.into_iter().map(|(_, part)| part).collect::<Vec<_>>();
+            contents.push(json!({"role": "user", "parts": parts}));
+            previous_responses_call = false;
+            continue;
+        }
+
         let mut parts = Vec::with_capacity(message.content.len());
         for content in &message.content {
             if let LLMContentKind::ToolCall {
@@ -225,10 +260,18 @@ fn messages_to_value(messages: &[LLMMessage]) -> Result<(Option<Value>, Vec<Valu
             } = &content.kind
             {
                 calls.insert(id.as_str(), name.as_str());
+                call_order.insert(id.as_str(), next_call);
+                next_call += 1;
             }
             parts.push(part_to_value(content, &calls)?);
         }
         let mut value = message_extensions_for(message, GEMINI);
+        let responses_call = message.source == Some(LLMProtocol::OpenAiResponses)
+            && message.role == LLMRole::Assistant
+            && message
+                .content
+                .iter()
+                .any(|part| matches!(part.kind, LLMContentKind::ToolCall { .. }));
         if matches!(message.role, LLMRole::System | LLMRole::Developer) {
             if !parts.iter().all(|part| part["text"].is_string()) {
                 return Err(AdapterError::Unsupported(
@@ -237,6 +280,13 @@ fn messages_to_value(messages: &[LLMMessage]) -> Result<(Option<Value>, Vec<Valu
             }
             system.get_or_insert(value);
             system_parts.extend(parts);
+        } else if responses_call
+            && previous_responses_call
+            && let Some(previous) = contents.last_mut()
+            && let Some(previous_parts) = previous["parts"].as_array_mut()
+        {
+            // Responses represents each call in the same assistant turn as its own input item.
+            previous_parts.extend(parts);
         } else {
             if message.source != Some(GEMINI) {
                 let role = if message.role == LLMRole::Assistant {
@@ -249,6 +299,7 @@ fn messages_to_value(messages: &[LLMMessage]) -> Result<(Option<Value>, Vec<Valu
             value.insert("parts".into(), Value::Array(parts));
             contents.push(Value::Object(value));
         }
+        previous_responses_call = responses_call;
     }
     Ok((
         system.map(|mut value| {
@@ -257,6 +308,18 @@ fn messages_to_value(messages: &[LLMMessage]) -> Result<(Option<Value>, Vec<Valu
         }),
         contents,
     ))
+}
+
+fn is_openai_tool_result(message: &LLMMessage) -> bool {
+    matches!(
+        message.source,
+        Some(LLMProtocol::OpenAiChat | LLMProtocol::OpenAiResponses)
+    ) && message.role == LLMRole::Tool
+        && !message.content.is_empty()
+        && message
+            .content
+            .iter()
+            .all(|part| matches!(part.kind, LLMContentKind::ToolResult { .. }))
 }
 
 fn parts_from_value(value: &Value) -> Result<Vec<LLMContent>, AdapterError> {

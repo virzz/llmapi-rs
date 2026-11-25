@@ -187,6 +187,8 @@ llmapi usage --date-range 2026-11-01 2026-11-24
 
 Unsupported non-default conversion parameters (such as Chat `n: 2`, `seed`, and `logprobs: true`) return `400`. Chat `reasoning_effort`, Responses `reasoning`, and Messages `thinking` / `output_config.effort` are not currently mapped to Gemini thinking settings; non-empty settings return `400`. Omit them to use model defaults. Native Interactions requests are unaffected by this conversion restriction.
 
+With tools enabled, Chat / Responses `parallel_tool_calls: false` and Messages `disable_parallel_tool_use: true` return `400` because Gemini cannot guarantee at most one call per turn. Chat streams include upstream usage before `[DONE]` only when `stream_options.include_usage: true`.
+
 Gemini tool-call `thoughtSignature` values round-trip through `extra_content.google.thought_signature` on Chat, Responses, and Messages output items. Clients must preserve this extension when sending tool-call history back.
 
 ```toml
