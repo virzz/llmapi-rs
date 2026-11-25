@@ -1984,7 +1984,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gemini_rejects_unresolvable_responses_context_before_forwarding() {
+    async fn gemini_rejects_unsupported_responses_options_before_forwarding() {
         let (upstream, captured) = start_upstream(json!({})).await;
         let mut config = test_config(&upstream);
         config.providers.insert(
@@ -1995,6 +1995,8 @@ mod tests {
         for (field, value) in [
             ("previous_response_id", json!("resp_1")),
             ("conversation", json!({"id": "conv_1"})),
+            ("reasoning", json!({"effort": "high"})),
+            ("background", json!(true)),
         ] {
             let mut input = json!({"model": "gemini", "input": "continue"});
             input[field] = value;

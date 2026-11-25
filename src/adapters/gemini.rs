@@ -4,7 +4,8 @@ use serde::Serialize;
 use serde_json::{json, Value};
 
 use super::{
-    content_extensions_for, extensions_without, message_extensions_for, value_as_extensions,
+    content_extensions_for, extensions_without, message_extensions_for, validate_request_extras,
+    value_as_extensions,
     AdapterError, RequestAdapter, ResponseAdapter, SseEvent, StreamAdapter, StreamState,
 };
 use crate::model::{
@@ -94,6 +95,18 @@ impl RequestAdapter for GeminiAdapter {
                         "Gemini cannot resolve {field}. Send the full conversation in input"
                     )));
                 }
+            }
+        }
+        if request.source != GEMINI {
+            // Gemini always reports stream usage; this client option needs no upstream field.
+            validate_request_extras(request, GEMINI, &[], &[], &["stream_options"])?;
+            if request.reasoning.as_ref().is_some_and(|reasoning| {
+                !reasoning.is_null() && !reasoning.as_object().is_some_and(Extensions::is_empty)
+            }) {
+                return Err(AdapterError::Unsupported(format!(
+                    "Gemini cannot preserve {:?} reasoning controls",
+                    request.source
+                )));
             }
         }
         let mut value = if request.source == GEMINI {
@@ -1218,6 +1231,57 @@ mod tests {
         anthropic::AnthropicAdapter, openai_chat::OpenAiChatAdapter,
         openai_responses::OpenAiResponsesAdapter,
     };
+
+    #[test]
+    fn rejects_nondefault_foreign_request_options() {
+        for (field, value) in [
+            ("n", json!(2)),
+            ("seed", json!(42)),
+            ("logprobs", json!(true)),
+        ] {
+            let mut input =
+                json!({"model": "gemini-2.5-flash", "messages": [{"role": "user", "content": "ping"}]});
+            input[field] = value;
+            let request = OpenAiChatAdapter::to_llm_request(input).unwrap();
+            assert!(matches!(GeminiAdapter::from_llm_request(&request),
+                Err(AdapterError::Unsupported(message)) if message.contains(field)));
+        }
+        let request = OpenAiChatAdapter::to_llm_request(json!({
+            "model": "gemini-2.5-flash", "messages": [{"role": "user", "content": "ping"}],
+            "n": 1, "logprobs": false, "store": false,
+            "stream": true, "stream_options": {"include_usage": true}
+        }))
+        .unwrap();
+        assert!(GeminiAdapter::from_llm_request(&request).is_ok());
+    }
+
+    #[test]
+    fn rejects_foreign_reasoning_controls_instead_of_using_model_defaults() {
+        let requests = [
+            OpenAiChatAdapter::to_llm_request(json!({
+                "model": "gemini-2.5-flash", "messages": [{"role": "user", "content": "ping"}],
+                "reasoning_effort": "none"
+            }))
+            .unwrap(),
+            OpenAiResponsesAdapter::to_llm_request(json!({
+                "model": "gemini-2.5-flash", "input": "ping", "reasoning": {"effort": "high"}
+            }))
+            .unwrap(),
+            AnthropicAdapter::to_llm_request(json!({
+                "model": "gemini-2.5-flash", "messages": [{"role": "user", "content": "ping"}],
+                "max_tokens": 4096, "thinking": {"type": "enabled", "budget_tokens": 1024}
+            }))
+            .unwrap(),
+        ];
+        for mut request in requests {
+            assert!(matches!(GeminiAdapter::from_llm_request(&request),
+                Err(AdapterError::Unsupported(message)) if message.contains("reasoning")));
+            for empty in [Value::Null, json!({})] {
+                request.reasoning = Some(empty);
+                assert!(GeminiAdapter::from_llm_request(&request).is_ok());
+            }
+        }
+    }
 
     #[test]
     fn converts_chat_text_response_to_a_gemini_candidate() {
