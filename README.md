@@ -123,6 +123,8 @@ instance_id = "上游 /health 返回的 instance_id" # 可预填；首次连通�
 
 代理按实际处理请求的 provider 和模型记录上游报告的用量。流式响应的累计值更新到同一条记录，缺失的计数保留为 SQL `NULL`。OpenAI Chat 流式请求可以设置 `stream_options.include_usage = true` 获取用量。
 
+`usage` 显示当前 UTC 日期范围和 provider 筛选，按 provider / model 分组并追加合计行。Token 使用十进制 `K / M / B / T` 缩写，最多保留两位小数（例如 `12.35K`、`1.2M`）；请求数使用千分位分隔。完全未上报的缓存和推理列隐藏，已上报的零值保留。`-` 表示未上报，合计只汇总已上报数值，不推算缺失的 total，也不把缓存或推理计数再次加到 total。
+
 用量快照通过容量为 1024 的后台队列异步写入。队列满或数据库写入失败时会记录警告并丢弃该快照；进程退出时尚未写入的快照可能丢失。Interactions 的创建、轮询和续读按 provider 与 interaction ID 去重，累计计数只向上更新。
 
 ```toml

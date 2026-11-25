@@ -5,7 +5,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use chrono::NaiveDate;
-use comfy_table::Table;
+use comfy_table::{Cell, CellAlignment, Table, presets::UTF8_FULL_CONDENSED};
 
 use axum::http::{Response, header};
 use futures_util::StreamExt;
@@ -68,8 +68,22 @@ impl UsageArgs {
                 ],
             )
             .await?;
-        let mut table = Table::new();
-        table.set_header([
+        let mut groups = Vec::new();
+        let mut totals = [None; 7];
+        while let Some(row) = rows.next().await? {
+            let mut counts = [None; 7];
+            for (index, count) in counts.iter_mut().enumerate() {
+                *count = row.get::<Option<i64>>(index + 2)?;
+                if let Some(value) = *count {
+                    *totals[index].get_or_insert(0) += value;
+                }
+            }
+            groups.push((row.get::<String>(0)?, row.get::<String>(1)?, counts));
+        }
+        if groups.is_empty() {
+            return Ok(empty.into());
+        }
+        let headers = [
             "PROVIDER",
             "MODEL",
             "REQUESTS",
@@ -79,23 +93,82 @@ impl UsageArgs {
             "CACHE READ",
             "CACHE CREATE",
             "REASONING",
-        ]);
-        while let Some(row) = rows.next().await? {
-            let mut cells = vec![row.get::<String>(0)?, row.get::<String>(1)?];
-            for column in 2..row.column_count() {
-                cells.push(
-                    row.get::<Option<i64>>(column)?
-                        .map_or_else(|| "-".into(), |n| n.to_string()),
-                );
-            }
+        ];
+        // Keep core counters visible; optional counters appear when any value was reported.
+        let columns: Vec<_> = (0..7)
+            .filter(|&index| index < 4 || totals[index].is_some())
+            .collect();
+        let mut table = Table::new();
+        table.load_style(UTF8_FULL_CONDENSED);
+        table.set_header(
+            headers[..2]
+                .iter()
+                .copied()
+                .chain(columns.iter().map(|index| headers[index + 2])),
+        );
+        groups.push(("TOTAL".into(), String::new(), totals));
+        for (provider, model, counts) in groups {
+            let mut cells = vec![Cell::new(provider), Cell::new(model)];
+            cells.extend(columns.iter().map(|&index| {
+                Cell::new(counts[index].map_or_else(
+                    || "-".into(),
+                    |value| {
+                        if index == 0 {
+                            format_count(value)
+                        } else {
+                            format_tokens(value)
+                        }
+                    },
+                ))
+                .set_alignment(CellAlignment::Right)
+            }));
             table.add_row(cells);
         }
-        Ok(if table.is_empty() {
-            empty.into()
-        } else {
-            table.to_string()
-        })
+        let period = match (start, end) {
+            (Some(start), Some(end)) if start == end => start.to_string(),
+            (Some(start), Some(end)) => format!("{start} to {end}"),
+            _ => "all dates".into(),
+        };
+        Ok(format!(
+            "Usage | UTC: {period} | Provider: {}\n{table}\nTokens: K/M/B/T = powers of 1,000; rounded to 2 decimals.\nSums use reported values only; - = not reported.\nTOTAL uses upstream totals; cache/reasoning are not added again.",
+            self.name.as_deref().unwrap_or("all"),
+        ))
     }
+}
+
+fn format_tokens(value: i64) -> String {
+    if value.unsigned_abs() < 1_000 {
+        return value.to_string();
+    }
+    let units = ["", "K", "M", "B", "T"];
+    let mut amount = value as f64;
+    let mut unit = 0;
+    // Promote values that would otherwise round to 1000 of the smaller unit.
+    while amount.abs() >= 999.995 && unit < units.len() - 1 {
+        amount /= 1_000.0;
+        unit += 1;
+    }
+    let number = format!("{amount:.2}");
+    format!(
+        "{}{}",
+        number.trim_end_matches('0').trim_end_matches('.'),
+        units[unit]
+    )
+}
+
+fn format_count(value: i64) -> String {
+    let digits = value.unsigned_abs().to_string();
+    let mut formatted = String::new();
+    if value < 0 {
+        formatted.push('-');
+    }
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            formatted.push(',');
+        }
+        formatted.push(digit);
+    }
+    formatted
 }
 
 pub(crate) struct Store {
@@ -546,6 +619,63 @@ mod tests {
         );
         assert!(matches!(receiver.try_recv().unwrap(), Write::Usage(_)));
         assert!(receiver.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn report_summarizes_reported_counts_without_inventing_missing_usage() {
+        use clap::Parser;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("usage.db");
+        let store = Store::new(path.clone());
+        store.database.connection().await.unwrap().lock().await.execute(
+            "INSERT INTO token_usage (id,provider,model,input_tokens,output_tokens,total_tokens,cache_read_tokens) VALUES
+             ('1','first','alpha',12000,345,12345,0),
+             ('2','second','beta',3000,NULL,NULL,NULL)", (),
+        ).await.unwrap();
+        let crate::Command::Usage(args) = crate::Cmd::parse_from(["llmapi", "usage"]).command
+        else {
+            unreachable!()
+        };
+        let report = args.report(&path).await.unwrap();
+        assert!(report.contains("UTC: all dates"));
+        assert!(report.contains("CACHE READ"));
+        assert!(!report.contains("CACHE CREATE") && !report.contains("REASONING"));
+        let total = report
+            .lines()
+            .find(|line| {
+                line.split(['│', '┆'])
+                    .nth(1)
+                    .is_some_and(|cell| cell.trim() == "TOTAL")
+            })
+            .unwrap();
+        let cells: Vec<_> = total
+            .split(['│', '┆'])
+            .skip(1)
+            .take(7)
+            .map(str::trim)
+            .collect();
+        assert_eq!(cells, ["TOTAL", "", "2", "15K", "345", "12.35K", "0"]);
+        let beta = report.lines().find(|line| line.contains("beta")).unwrap();
+        assert!(beta.contains("3K"));
+        assert_eq!(beta.matches('-').count(), 3);
+        assert!(report.contains("reported values only"));
+    }
+
+    #[test]
+    fn token_display_uses_decimal_units_and_promotes_rounded_boundaries() {
+        for (tokens, expected) in [
+            (0, "0"),
+            (999, "999"),
+            (1_000, "1K"),
+            (12_345, "12.35K"),
+            (999_999, "1M"),
+            (1_200_000, "1.2M"),
+            (2_500_000_000, "2.5B"),
+            (1_000_000_000_000, "1T"),
+        ] {
+            assert_eq!(format_tokens(tokens), expected);
+        }
+        assert_eq!(format_count(12_345), "12,345");
     }
 
     #[tokio::test]

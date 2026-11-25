@@ -180,6 +180,8 @@ Automatic updates require a writable configuration file and reserialize it, losi
 
 ## Token usage
 
+`usage` shows the active UTC date range and provider filter, groups rows by provider / model, and adds a total row. Tokens use decimal `K / M / B / T` suffixes with up to two decimal places (for example, `12.35K` or `1.2M`); request counts use thousands separators. Cache and reasoning columns are hidden only when entirely unreported; reported zeros remain visible. `-` means unreported. Totals sum reported values only, without deriving missing totals or adding cache/reasoning counts to them again.
+
 Token usage recording is enabled by default. The first write creates `usage.db` beside the configuration file. Set the top-level `usage_db = false` to disable recording. A custom relative database path resolves against the configuration file’s directory.
 
 The server and the reporting CLI use Turso multiprocess WAL on a supported local filesystem. Each usage update commits atomically, and a report reads a consistent snapshot.
