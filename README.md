@@ -76,7 +76,7 @@ journalctl --user -u llmapi.service -f
 `./config.{toml,yaml,yml,json}`，再依次查找
 `~/.config/enyo/llmapi.{yaml,toml,yml,json}`。全部不存在时，回退路径为
 `~/.config/enyo/llmapi.yaml`。显式选择的文件不会回退；`add` 可以在该路径创建新文件。`server` 命令的 `--server` 和 `--default` 参数会覆盖所选文件中的监听地址和默认 provider，但不修改文件。
-设置顶层 `apikey`（例如 `apikey: ${LLMAPI_API_KEY}`）后，所有 HTTP 路由都要求客户端密钥。客户端可以通过 `Authorization: Bearer <key>`、`x-api-key`、`api-key` 或 `key` 查询参数发送密钥。缺失或错误的密钥返回 401。未设置顶层 `apikey` 时服务器保持开放；provider 的 `apikey` 仍是独立的上游凭据。
+设置顶层 `apikey`（例如 `apikey: ${LLMAPI_API_KEY}`）后，除 `/health` 外的 HTTP 路由都要求客户端密钥。客户端可以通过 `Authorization: Bearer <key>`、`x-api-key`、`api-key` 或 `key` 查询参数发送密钥。缺失或错误的密钥返回 401。未设置顶层 `apikey` 时服务器保持开放；provider 的 `apikey` 仍是独立的上游凭据。
 设置顶层 `access_log = true`（YAML：`access_log: true`）后，每个 HTTP 请求都会向 stdout 写入一行访问日志，包含客户端地址、方法、脱敏后的路径、响应状态和处理耗时。所有请求都会记录，包括被拒绝的请求；默认关闭。服务器重新加载配置文件后，该设置对新请求生效。
 服务运行期间，每 500 ms 检查一次所选配置文件，并将有效的 provider/默认 provider 变更应用到新请求。修改 `server` 时先绑定新监听器，再关闭旧监听器；绑定失败时保留旧监听器并重试。无效或缺失的文件保留最后一次有效配置；修改所选配置路径需要重启。
 
@@ -97,6 +97,23 @@ journalctl --user -u llmapi.service -f
 `GET /models` 和 `GET /v1/models`（也支持 `/{provider}` 前缀）接受上游 OpenAI `data` 或 Codex `models` 列表，并按所选 provider 的模型限制过滤。Codex 请求（通过 `client_version` 或 Codex User-Agent 识别）收到 `models`；其他客户端收到 OpenAI `data`。格式转换时会补齐缺失的元数据。
 
 `GET /providers` 返回当前默认 provider 和所有已配置 provider。每个已配置的 `apikey` 返回为 `***`；未设置的密钥会被省略。该端点不会展开环境变量，也不会联系上游 provider。
+
+## 健康检查与上游地址发现
+
+`GET /health` 无需鉴权，仅返回 `{"service":"llmapi","instance_id":"<唯一标识>"}`。`server` 首次启动时生成 UUID，保存为配置顶层的 `instance_id`；重启和 IP 变化不改变标识。复制配置部署独立实例时，应删除顶层 `instance_id` 以生成新标识。
+
+`type = "llmapi"` 的 provider 在服务启动时检测健康状态，首次成功后把上游的 `instance_id` 写入该 provider。运行中仅在连接失败时重新检测；HTTP 错误状态和已开始的响应不会触发发现或重放生成请求。配置新增或修改的 provider 在首次使用时检测。
+
+已知实例不可达或标识不匹配时，扫描原 IPv4 的 `/24` 网段（`.1`–`.254`），保持协议、端口和路径，仅接受相同 `instance_id` 的唯一实例，然后原子更新配置中的 `baseurl` 并重试连接。扫描最多并发 32 个请求，单个健康请求限时 750 ms，不携带 API 密钥。多个实例报告相同标识时拒绝更新；未知标识且首次连接失败时也不会随意选择其他上游。域名和 IPv6 地址不进行网段扫描。
+
+```toml
+[providers.remote]
+type = "llmapi"
+baseurl = "http://192.168.1.10:8080/v1"
+instance_id = "上游 /health 返回的 instance_id" # 可预填；首次连通后自动记录
+```
+
+自动写回要求配置文件可写，会重新序列化配置（不保留注释和原排版）。嵌入式 `serve` 没有配置路径，仅在内存中维护发现结果；嵌入式 `app` 只提供路由，需由调用方管理实例标识及发现。
 
 ## Token 用量
 

@@ -74,6 +74,7 @@ struct RequestPlan {
 enum SendError {
     Timeout,
     Request(reqwest::Error),
+    Discovery(String),
 }
 
 enum Attempt {
@@ -275,7 +276,7 @@ pub async fn handle_with_websocket(
             true,
             true,
         );
-        return match send_plan(&state, &plan, None).await {
+        return match send_plan(&state, &provider_name, &plan, None).await {
             Ok(upstream_response) => build_response(plan.mode, upstream_response).await,
             Err(err) => send_error_response(&input, err, None),
         };
@@ -360,7 +361,7 @@ pub async fn handle_with_websocket(
         Ok(plan) => plan,
         Err(response) => return *response,
     };
-    let upstream_response = match send_plan(&state, &plan, None).await {
+    let upstream_response = match send_plan(&state, &provider_name, &plan, None).await {
         Ok(upstream_response) => upstream_response,
         Err(err) => return send_error_response(&input, err, None),
     };
@@ -466,7 +467,7 @@ async fn proxy_interactions(
         conditional: false,
         follow_redirects: false,
     };
-    match send_plan(state, &plan, None).await {
+    match send_plan(state, provider_name, &plan, None).await {
         Ok(upstream_response) => {
             let response = if endpoint == InteractionsEndpoint::Create || plan.method == Method::GET
             {
@@ -493,6 +494,7 @@ fn send_error_response(
     let message = match err {
         SendError::Timeout => "upstream response header timeout".to_string(),
         SendError::Request(err) => redact::transport_error(err),
+        SendError::Discovery(message) => message,
     };
     match member {
         Some(member) => {
@@ -536,7 +538,23 @@ async fn proxy_websocket(
         extracted.as_deref(),
     );
     auth::apply_protocol_headers(&mut upstream_headers, upstream.protocol, &headers);
-    let url = websocket_url(&upstream.base_url, "/responses", query.as_deref());
+    let discovery = state
+        .discovery
+        .as_ref()
+        .filter(|_| upstream.protocol == Protocol::Llmapi);
+    let base_url = if let Some(discovery) = discovery {
+        match discovery.current(&name, &upstream).await {
+            Ok(base) => base,
+            Err(error) => {
+                warn!(%error, "llmapi WebSocket discovery failed");
+                let _ = client.close().await;
+                return;
+            }
+        }
+    } else {
+        upstream.base_url.clone()
+    };
+    let url = websocket_url(&base_url, "/responses", query.as_deref());
     let mut upstream_request = match url.into_client_request() {
         Ok(request) => request,
         Err(err) => {
@@ -549,7 +567,32 @@ async fn proxy_websocket(
     for (name, value) in &upstream_headers {
         upstream_request.headers_mut().insert(name, value.clone());
     }
-    let (upstream_socket, _) = match tokio_tungstenite::connect_async(upstream_request).await {
+    let mut connection = tokio_tungstenite::connect_async(upstream_request.clone()).await;
+    if matches!(
+        &connection,
+        Err(tokio_tungstenite::tungstenite::Error::Io(_))
+    ) && let Some(discovery) = discovery
+    {
+        match discovery.recover(&name, &upstream, &base_url).await {
+            Ok(base) => {
+                let url = websocket_url(&base, "/responses", query.as_deref());
+                *upstream_request.uri_mut() = url.parse().expect("validated upstream URL");
+                let authority = upstream_request
+                    .uri()
+                    .authority()
+                    .expect("WebSocket URL has authority")
+                    .as_str()
+                    .to_owned();
+                upstream_request.headers_mut().insert(
+                    header::HOST,
+                    HeaderValue::from_str(&authority).expect("validated upstream authority"),
+                );
+                connection = tokio_tungstenite::connect_async(upstream_request).await;
+            }
+            Err(error) => warn!(%error, "llmapi WebSocket recovery failed"),
+        }
+    }
+    let (upstream_socket, _) = match connection {
         Ok(connection) => connection,
         Err(err) => {
             warn!(target: "llmapi", error = %err, "upstream WebSocket connection failed");
@@ -983,6 +1026,7 @@ fn plan_generate(
 
 async fn send_plan(
     state: &AppState,
+    provider_name: &str,
     plan: &RequestPlan,
     timeout: Option<std::time::Duration>,
 ) -> Result<reqwest::Response, SendError> {
@@ -1019,17 +1063,58 @@ async fn send_plan(
     } else {
         &state.client
     };
-    let request = client
-        .request(plan.method.clone(), &plan.url)
-        .headers(headers)
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(plan.body.clone());
+    let send = |url: String| {
+        client
+            .request(plan.method.clone(), url)
+            .headers(headers.clone())
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(plan.body.clone())
+            .send()
+    };
+    let attempt = async {
+        let relay = state
+            .discovery
+            .as_ref()
+            .filter(|_| plan.protocol == Protocol::Llmapi)
+            .zip(
+                state
+                    .config
+                    .providers
+                    .get(provider_name)
+                    .and_then(ProviderConfig::as_upstream),
+            );
+        let mut url = plan.url.clone();
+        let base = if let Some((discovery, upstream)) = relay {
+            let base = discovery
+                .current(provider_name, upstream)
+                .await
+                .map_err(|err| SendError::Discovery(err.to_string()))?;
+            url = crate::discovery::relocate(&url, &base)
+                .map_err(|err| SendError::Discovery(err.to_string()))?;
+            Some(base)
+        } else {
+            None
+        };
+        match send(url).await {
+            Err(error) if error.is_connect() && relay.is_some() => {
+                let (discovery, upstream) = relay.unwrap();
+                let base = discovery
+                    .recover(provider_name, upstream, base.as_deref().unwrap())
+                    .await
+                    .map_err(|err| SendError::Discovery(err.to_string()))?;
+                let url = crate::discovery::relocate(&plan.url, &base)
+                    .map_err(|err| SendError::Discovery(err.to_string()))?;
+                send(url).await.map_err(SendError::Request)
+            }
+            result => result.map_err(SendError::Request),
+        }
+    };
     match timeout {
-        Some(limit) => match tokio::time::timeout(limit, request.send()).await {
-            Ok(result) => result.map_err(SendError::Request),
+        Some(limit) => match tokio::time::timeout(limit, attempt).await {
+            Ok(result) => result,
             Err(_) => Err(SendError::Timeout),
         },
-        None => request.send().await.map_err(SendError::Request),
+        None => attempt.await,
     }
 }
 
@@ -1156,7 +1241,7 @@ async fn attempt_member(
         },
     };
     let timeout = state.lb_header_timeout;
-    let upstream_response = match send_plan(state, &plan, Some(timeout)).await {
+    let upstream_response = match send_plan(state, member, &plan, Some(timeout)).await {
         Ok(response) => response,
         Err(SendError::Timeout) => {
             return Attempt::Switch(format!(
@@ -1165,6 +1250,7 @@ async fn attempt_member(
             ));
         }
         Err(SendError::Request(err)) => return Attempt::Switch(redact::transport_error(err)),
+        Err(SendError::Discovery(message)) => return Attempt::Switch(message),
     };
     if lb::is_retryable_status(upstream_response.status()) {
         return Attempt::Switch(format!("upstream status {}", upstream_response.status()));

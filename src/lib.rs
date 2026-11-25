@@ -8,6 +8,7 @@ mod codex;
 pub mod config;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub mod daemon;
+mod discovery;
 pub mod lb;
 pub mod model;
 mod models;
@@ -1313,6 +1314,7 @@ mod tests {
     #[test]
     fn provider_list_marks_default_without_api_keys() {
         let config = Config {
+            instance_id: None,
             server: "127.0.0.1:8080".into(),
             access_log: false,
             usage_db: Default::default(),
@@ -1360,6 +1362,7 @@ mod tests {
         assert_eq!(args.default.as_deref(), Some("openai"));
 
         let mut config = Config {
+            instance_id: None,
             server: "127.0.0.1:8080".into(),
             access_log: false,
             usage_db: Default::default(),
@@ -1713,6 +1716,7 @@ mod tests {
         .await;
         let host = rejected.trim_start_matches("http://");
         let upstream = UpstreamConfig {
+            instance_id: None,
             protocol: Protocol::OpenAiChat,
             base_url: format!("http://alice:s3cr3t-url-pass@{host}/v1"),
             api_key: None,
@@ -1764,6 +1768,7 @@ mod tests {
         ))
         .await;
         let upstream = UpstreamConfig {
+            instance_id: None,
             protocol: Protocol::OpenAiChat,
             base_url: format!("{rejected}/v1?api_key=sk-query-secret"),
             api_key: None,
@@ -1840,6 +1845,7 @@ mod tests {
             .await;
             let host = mock.trim_start_matches("http://");
             let upstream = UpstreamConfig {
+                instance_id: None,
                 protocol: Protocol::OpenAiChat,
                 base_url: format!("http://{userinfo}@{host}/v1"),
                 api_key: None,
@@ -1899,6 +1905,7 @@ mod tests {
         ))
         .await;
         let upstream = UpstreamConfig {
+            instance_id: None,
             protocol: Protocol::OpenAiChat,
             base_url: format!("{rejected}/v1?api_key=sk%2Dquery%2Dsecret"),
             api_key: None,
@@ -1958,6 +1965,7 @@ mod tests {
         .await;
         let host = rejected.trim_start_matches("http://");
         let upstream = UpstreamConfig {
+            instance_id: None,
             protocol: Protocol::OpenAiChat,
             base_url: format!("http://alice:p%22ass-word@{host}/v1"),
             api_key: None,

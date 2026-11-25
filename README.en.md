@@ -116,7 +116,7 @@ An explicitly selected file never falls back; `add` can create a new file there.
 The `server` command's `--server` and `--default` arguments override the selected
 file's listen address and default provider without modifying the file.
 Set top-level `apikey` (for example, `apikey: ${LLMAPI_API_KEY}`) to require a
-client key on every HTTP route. Clients can send `Authorization: Bearer <key>`,
+client key on every HTTP route except `/health`. Clients can send `Authorization: Bearer <key>`,
 `x-api-key`, `api-key`, or the `key` query parameter. Missing or incorrect keys
 return 401. An unset top-level `apikey` keeps the server open; provider `apikey`
 values remain separate upstream credentials.
@@ -160,6 +160,23 @@ OpenAI `data`. Missing metadata is synthesized when converting between formats.
 `GET /providers` returns the active default and all configured providers. Each
 configured `apikey` is returned as `***`; unset keys are omitted. The endpoint
 does not resolve environment variables or contact upstream providers.
+
+## Health and upstream discovery
+
+Unauthenticated `GET /health` returns only `{"service":"llmapi","instance_id":"<unique ID>"}`. On first startup, `server` generates a UUID and saves it as the top-level `instance_id`. It survives restarts and IP changes. Remove that top-level ID when copying a configuration to an independent instance.
+
+Providers with `type = "llmapi"` are checked at startup and record the upstream `instance_id` on first successful contact. During normal operation, discovery runs only after connection failures, not HTTP error statuses or response-stream failures. Newly added or edited providers are checked on first use.
+
+If a known instance is unreachable or its identity differs, discovery scans the original IPv4 `/24` (`.1`–`.254`), preserving the scheme, port and path. Only a unique matching `instance_id` is accepted; the provider's `baseurl` is then atomically saved and the connection retried. Probes use at most 32 concurrent requests, a 750 ms timeout each, and no API credentials. Duplicate matching IDs or an unreachable provider without a known ID cannot be automatically rebound. Hostnames and IPv6 addresses are not scanned.
+
+```toml
+[providers.remote]
+type = "llmapi"
+baseurl = "http://192.168.1.10:8080/v1"
+instance_id = "ID returned by upstream /health" # Optional until first successful contact
+```
+
+Automatic updates require a writable configuration file and reserialize it, losing comments and original formatting. Embedded `serve` has no config path and keeps discovery state in memory; embedded `app` only supplies routes, leaving identity and discovery management to the caller.
 
 ## Token usage
 

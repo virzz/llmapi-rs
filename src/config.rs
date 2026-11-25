@@ -13,6 +13,8 @@ pub const LB_TYPE: &str = "lb";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Config {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_id: Option<String>,
     #[serde(default = "default_server")]
     pub server: String,
     #[serde(default, skip_serializing_if = "is_false")]
@@ -116,6 +118,7 @@ pub struct UpstreamConfig {
     pub api_key: Option<String>,
     /// Allowed model IDs. An empty list allows any model.
     pub models: Vec<String>,
+    pub instance_id: Option<String>,
 }
 
 /// A round-robin load-balancer group over existing providers.
@@ -216,6 +219,7 @@ pub enum ConfigError {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            instance_id: None,
             server: default_server(),
             access_log: false,
             usage_db: UsageDb::default(),
@@ -404,6 +408,7 @@ impl ProviderConfig {
             base_url: base_url.into(),
             api_key,
             models: Vec::new(),
+            instance_id: None,
         })
     }
 
@@ -622,12 +627,17 @@ struct ProviderConfigRaw {
     models: Option<Option<Vec<String>>>,
     #[serde(default, deserialize_with = "deserialize_present")]
     members: Option<Option<Vec<String>>>,
+    #[serde(default)]
+    instance_id: Option<String>,
 }
 
 impl ProviderConfigRaw {
     fn into_config(self) -> Result<ProviderConfig, String> {
         match self.provider_type {
             Provider::Lb => {
+                if self.instance_id.is_some() {
+                    return Err("lb provider does not accept `instance_id`".into());
+                }
                 if self.base_url.is_some() {
                     return Err("lb provider does not accept `baseurl`".into());
                 }
@@ -659,11 +669,15 @@ impl ProviderConfigRaw {
                 };
                 let protocol = Protocol::from_provider(provider_type)
                     .ok_or_else(|| format!("unknown provider type: {provider_type}"))?;
+                if self.instance_id.is_some() && protocol != Protocol::Llmapi {
+                    return Err("only llmapi providers accept `instance_id`".into());
+                }
                 Ok(ProviderConfig::Upstream(UpstreamConfig {
                     protocol,
                     base_url,
                     api_key: self.api_key.flatten(),
                     models: self.models.flatten().unwrap_or_default(),
+                    instance_id: self.instance_id,
                 }))
             }
         }
@@ -690,6 +704,8 @@ struct UpstreamWire<'a> {
     api_key: Option<&'a str>,
     #[serde(skip_serializing_if = "<[String]>::is_empty")]
     models: &'a [String],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    instance_id: Option<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -710,6 +726,7 @@ impl Serialize for ProviderConfig {
                 baseurl: &upstream.base_url,
                 api_key: upstream.api_key.as_deref(),
                 models: &upstream.models,
+                instance_id: upstream.instance_id.as_deref(),
             }
             .serialize(serializer),
             Self::Lb(lb) => LbWire {

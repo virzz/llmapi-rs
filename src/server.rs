@@ -27,6 +27,7 @@ use super::{
 
 #[derive(Clone)]
 pub struct AppState {
+    pub(crate) discovery: Option<Arc<crate::discovery::Discovery>>,
     pub(crate) usage: Option<Arc<crate::usage::Store>>,
     pub config: Arc<Config>,
     pub client: reqwest::Client,
@@ -43,6 +44,8 @@ pub struct AppState {
 
 /// One atomically published config version plus its load-balancer cursors.
 pub struct Runtime {
+    instance_id: String,
+    discovery: Option<Arc<crate::discovery::Discovery>>,
     usage: Option<Arc<crate::usage::Store>>,
     pub config: Arc<Config>,
     pub lb: Arc<lb::State>,
@@ -53,6 +56,11 @@ impl Runtime {
     fn new(config: Config) -> Self {
         let lb = Arc::new(lb::State::new(&config));
         Self {
+            instance_id: config
+                .instance_id
+                .clone()
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+            discovery: None,
             usage: config
                 .usage_db
                 .path()
@@ -96,6 +104,7 @@ impl ServerState {
             runtime.config.clone()
         };
         AppState {
+            discovery: runtime.discovery.clone(),
             usage: runtime.usage.clone(),
             config,
             client: self.client.clone(),
@@ -109,12 +118,16 @@ impl ServerState {
 }
 
 pub fn app(config: Config) -> Router {
-    let auth_path = if config.injects.codex {
+    app_runtime(Runtime::new(config))
+}
+
+fn app_runtime(runtime: Runtime) -> Router {
+    let auth_path = if runtime.config.injects.codex {
         codex::auth_path()
     } else {
         None
     };
-    let (_, runtime) = watch::channel(Arc::new(Runtime::new(config)));
+    let (_, runtime) = watch::channel(Arc::new(runtime));
     app_with_auth(runtime, codex::watch_auth(auth_path))
 }
 
@@ -139,8 +152,14 @@ fn app_with_auth(
             state.clone(),
             require_api_key,
         ))
+        .route("/health", get(health))
         .layer(middleware::from_fn_with_state(state.clone(), access_log))
         .with_state(state)
+}
+
+async fn health(State(state): State<ServerState>) -> impl IntoResponse {
+    let id = state.runtime.borrow().instance_id.clone();
+    Json(json!({"service": "llmapi", "instance_id": id}))
 }
 
 fn build_client(follow_redirects: bool) -> reqwest::Client {
@@ -234,12 +253,16 @@ async fn providers(State(state): State<ServerState>) -> impl IntoResponse {
     Json(json!({"default": config.default, "providers": config.providers}))
 }
 
-pub async fn serve(addr: SocketAddr, config: Config) -> Result<()> {
+pub async fn serve(addr: SocketAddr, mut config: Config) -> Result<()> {
+    let discovery = Arc::new(crate::discovery::Discovery::new(None));
+    discovery.initialize(&mut config).await?;
+    let mut runtime = Runtime::new(config);
+    runtime.discovery = Some(discovery);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     info!(target: "llmapi", address = %listener.local_addr()?, "server listening");
     axum::serve(
         listener,
-        app(config).into_make_service_with_connect_info::<SocketAddr>(),
+        app_runtime(runtime).into_make_service_with_connect_info::<SocketAddr>(),
     )
     .await?;
     Ok(())
@@ -247,15 +270,19 @@ pub async fn serve(addr: SocketAddr, config: Config) -> Result<()> {
 
 pub(crate) async fn serve_reloading(
     addr: SocketAddr,
-    config: Config,
+    mut config: Config,
     path: PathBuf,
     server_override: bool,
     default_override: Option<String>,
 ) -> Result<()> {
+    let discovery = Arc::new(crate::discovery::Discovery::new(Some(path.clone())));
+    discovery.initialize(&mut config).await?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
     info!(target: "llmapi", address = %listener.local_addr()?, "server listening");
     let mut listen_address = config.server.clone();
-    let (sender, mut receiver) = watch::channel(Arc::new(Runtime::new(config)));
+    let mut runtime = Runtime::new(config);
+    runtime.discovery = Some(discovery);
+    let (sender, mut receiver) = watch::channel(Arc::new(runtime));
     let watcher = watch_config(
         path,
         listen_address.clone(),
@@ -426,7 +453,11 @@ async fn watch_config(
             Ok(config) => {
                 last_error = None;
                 if sender.borrow().config.as_ref() != &config {
-                    sender.send_replace(Arc::new(Runtime::new(config)));
+                    let previous = sender.borrow().clone();
+                    let mut next = Runtime::new(config);
+                    next.discovery = previous.discovery.clone();
+                    next.instance_id = previous.instance_id.clone();
+                    sender.send_replace(Arc::new(next));
                     info!(target: "llmapi", path = %path.display(), "config reloaded");
                 }
             }
@@ -491,6 +522,45 @@ mod tests {
         uri: Uri,
         headers: HeaderMap,
         body: Value,
+    }
+
+    #[tokio::test]
+    async fn health_exposes_only_stable_identity_without_authentication() {
+        let mut config = test_config("http://127.0.0.1:1");
+        config.instance_id = Some("test-instance".into());
+        config.api_key = Some("server-secret".into());
+        let proxy = start_proxy(config.clone()).await;
+        let client = reqwest::Client::new();
+        for _ in 0..2 {
+            let response = client
+                .get(format!("http://{proxy}/health"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.json::<Value>().await.unwrap(),
+                json!({"service": "llmapi", "instance_id": "test-instance"})
+            );
+        }
+        let protected = client
+            .get(format!("http://{proxy}/providers"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(protected.status(), StatusCode::UNAUTHORIZED);
+        let restarted = start_proxy(config).await;
+        assert_eq!(
+            client
+                .get(format!("http://{restarted}/health"))
+                .send()
+                .await
+                .unwrap()
+                .json::<Value>()
+                .await
+                .unwrap()["instance_id"],
+            "test-instance"
+        );
     }
 
     #[derive(Clone)]
@@ -660,6 +730,7 @@ mod tests {
 
     fn test_config(base_url: &str) -> Config {
         Config {
+            instance_id: None,
             server: "127.0.0.1:0".into(),
             access_log: false,
             usage_db: false.into(),
