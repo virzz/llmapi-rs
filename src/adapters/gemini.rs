@@ -1,12 +1,12 @@
 use std::collections::BTreeMap;
 
 use serde::Serialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use super::{
+    AdapterError, RequestAdapter, ResponseAdapter, SseEvent, StreamAdapter, StreamState,
     content_extensions_for, extensions_without, message_extensions_for, validate_request_extras,
     value_as_extensions,
-    AdapterError, RequestAdapter, ResponseAdapter, SseEvent, StreamAdapter, StreamState,
 };
 use crate::model::{
     Extensions, LLMChoice, LLMContent, LLMContentKind, LLMFinishReason, LLMMediaSource, LLMMessage,
@@ -492,12 +492,18 @@ fn part_to_value(
                 call.insert("args".into(), arguments);
             }
             part["functionCall"] = json!(call);
-            if matches!(content.source, Some(LLMProtocol::OpenAiChat | LLMProtocol::OpenAiResponses | LLMProtocol::AnthropicMessages))
-                && let Some(signature) = content
-                    .metadata
-                    .get("extra_content")
-                    .and_then(|extra| extra.pointer("/google/thought_signature"))
-                    .and_then(Value::as_str)
+            if matches!(
+                content.source,
+                Some(
+                    LLMProtocol::OpenAiChat
+                        | LLMProtocol::OpenAiResponses
+                        | LLMProtocol::AnthropicMessages
+                )
+            ) && let Some(signature) = content
+                .metadata
+                .get("extra_content")
+                .and_then(|extra| extra.pointer("/google/thought_signature"))
+                .and_then(Value::as_str)
             {
                 part["thoughtSignature"] = json!(signature);
             }
@@ -1302,8 +1308,7 @@ mod tests {
             ("seed", json!(42)),
             ("logprobs", json!(true)),
         ] {
-            let mut input =
-                json!({"model": "gemini-2.5-flash", "messages": [{"role": "user", "content": "ping"}]});
+            let mut input = json!({"model": "gemini-2.5-flash", "messages": [{"role": "user", "content": "ping"}]});
             input[field] = value;
             let request = OpenAiChatAdapter::to_llm_request(input).unwrap();
             assert!(matches!(GeminiAdapter::from_llm_request(&request),
@@ -1501,8 +1506,7 @@ mod tests {
             OpenAiResponsesAdapter::to_llm_request(json!({"model":"gemini","input":[items[1]]}))
                 .unwrap();
         assert_eq!(
-            GeminiAdapter::from_llm_request(&request).unwrap()["contents"][0]["parts"][0]
-                ["thoughtSignature"],
+            GeminiAdapter::from_llm_request(&request).unwrap()["contents"][0]["parts"][0]["thoughtSignature"],
             "c2ln"
         );
 
@@ -1525,12 +1529,15 @@ mod tests {
                 GeminiAdapter::format_stream_events(&events, &mut formatted).unwrap()
             })
             .collect::<Vec<_>>();
-        assert!(output
-            .iter()
-            .filter_map(|chunk| serde_json::from_str::<Value>(&chunk.data).ok())
-            .any(
-                |value| value["candidates"][0]["content"]["parts"][0]["thoughtSignature"] == "c2ln"
-            ));
+        assert!(
+            output
+                .iter()
+                .filter_map(|chunk| serde_json::from_str::<Value>(&chunk.data).ok())
+                .any(
+                    |value| value["candidates"][0]["content"]["parts"][0]["thoughtSignature"]
+                        == "c2ln"
+                )
+        );
 
         let chunks =
             AnthropicAdapter::format_stream_events(&events, &mut StreamState::default()).unwrap();
@@ -1554,12 +1561,15 @@ mod tests {
                 GeminiAdapter::format_stream_events(&events, &mut formatted).unwrap()
             })
             .collect::<Vec<_>>();
-        assert!(output
-            .iter()
-            .filter_map(|chunk| serde_json::from_str::<Value>(&chunk.data).ok())
-            .any(
-                |value| value["candidates"][0]["content"]["parts"][0]["thoughtSignature"] == "c2ln"
-            ));
+        assert!(
+            output
+                .iter()
+                .filter_map(|chunk| serde_json::from_str::<Value>(&chunk.data).ok())
+                .any(
+                    |value| value["candidates"][0]["content"]["parts"][0]["thoughtSignature"]
+                        == "c2ln"
+                )
+        );
     }
 
     #[test]
@@ -1674,9 +1684,11 @@ mod tests {
             matches!(&events[0], LLMStreamEvent::MessageStart { id: Some(id), .. } if id == "res")
         );
         assert!(events.iter().any(|event| matches!(event, LLMStreamEvent::ReasoningDelta { text: Some(text), .. } if text == "check")));
-        assert!(events
-            .iter()
-            .any(|event| matches!(event, LLMStreamEvent::TextDelta { text, .. } if text == "hi")));
+        assert!(
+            events.iter().any(
+                |event| matches!(event, LLMStreamEvent::TextDelta { text, .. } if text == "hi")
+            )
+        );
         assert!(
             matches!(events.last(), Some(LLMStreamEvent::MessageEnd { finish_reason: Some(LLMFinishReason::ToolCalls), usage: Some(usage), .. }) if usage.output_tokens == Some(5))
         );
@@ -1688,10 +1700,12 @@ mod tests {
             })
             .map(|event| serde_json::from_str::<Value>(&event.data).unwrap())
             .collect::<Vec<_>>();
-        assert!(output
-            .iter()
-            .any(|value| value["candidates"][0]["content"]["parts"][0]
-                == chunks[1]["candidates"][0]["content"]["parts"][0]));
+        assert!(
+            output
+                .iter()
+                .any(|value| value["candidates"][0]["content"]["parts"][0]
+                    == chunks[1]["candidates"][0]["content"]["parts"][0])
+        );
         assert_eq!(
             output.last().unwrap()["candidates"][0]["finishReason"],
             "STOP"

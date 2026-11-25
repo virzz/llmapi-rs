@@ -24,12 +24,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{anyhow, bail, Context, Result};
-use axum::http::{header, HeaderMap, Method};
+use anyhow::{Context, Result, anyhow, bail};
+use axum::http::{HeaderMap, Method, header};
 use clap::{Args, CommandFactory, Parser, Subcommand};
-use clap_complete::{generate, Shell};
+use clap_complete::{Shell, generate};
 use comfy_table::Table;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use config::{Config, Protocol, Provider, ProviderConfig, UpstreamConfig};
 
@@ -506,7 +506,10 @@ impl Cmd {
             Command::Check(args) => self.check(args).await,
             Command::Usage(args) => {
                 let config = self.load_config()?;
-                let path = config.usage_db.path().context("usage recording is disabled in the configuration")?;
+                let path = config
+                    .usage_db
+                    .path()
+                    .context("usage recording is disabled in the configuration")?;
                 println!("{}", args.report(&path).await?);
                 Ok(())
             }
@@ -970,8 +973,8 @@ fn remaining_budget(deadline: Instant) -> Result<Duration> {
 mod tests {
     use super::*;
     use axum::{
-        routing::{get, post},
         Json, Router,
+        routing::{get, post},
     };
     use std::{collections::BTreeMap, fs};
     use tempfile::tempdir;
@@ -1148,18 +1151,20 @@ mod tests {
             interactive.command,
             Command::Add(AddArgs { apikey: true, .. })
         ));
-        assert!(Cmd::try_parse_from([
-            "llmapi",
-            "add",
-            "openai",
-            "--type",
-            "responses",
-            "--baseurl",
-            "https://api.openai.test",
-            "--apikey",
-            "plaintext",
-        ])
-        .is_err());
+        assert!(
+            Cmd::try_parse_from([
+                "llmapi",
+                "add",
+                "openai",
+                "--type",
+                "responses",
+                "--baseurl",
+                "https://api.openai.test",
+                "--apikey",
+                "plaintext",
+            ])
+            .is_err()
+        );
         let lb = Cmd::parse_from([
             "llmapi",
             "add",
@@ -1177,31 +1182,35 @@ mod tests {
                 ..
             }) if members == &vec!["primary".to_string(), "secondary".to_string()]
         ));
-        assert!(Cmd::try_parse_from([
-            "llmapi",
-            "add",
-            "pool",
-            "--type",
-            "lb",
-            "--members",
-            "primary",
-            "--baseurl",
-            "https://example.test",
-        ])
-        .is_err());
+        assert!(
+            Cmd::try_parse_from([
+                "llmapi",
+                "add",
+                "pool",
+                "--type",
+                "lb",
+                "--members",
+                "primary",
+                "--baseurl",
+                "https://example.test",
+            ])
+            .is_err()
+        );
         assert!(Cmd::try_parse_from(["llmapi", "add", "pool", "--type", "lb"]).is_err());
-        assert!(Cmd::try_parse_from([
-            "llmapi",
-            "add",
-            "plain",
-            "--type",
-            "chat",
-            "--baseurl",
-            "https://example.test",
-            "--members",
-            "a,b",
-        ])
-        .is_err());
+        assert!(
+            Cmd::try_parse_from([
+                "llmapi",
+                "add",
+                "plain",
+                "--type",
+                "chat",
+                "--baseurl",
+                "https://example.test",
+                "--members",
+                "a,b",
+            ])
+            .is_err()
+        );
         let remove = Cmd::parse_from(["llmapi", "rm", "deepseek"]);
         assert!(matches!(remove.command, Command::Remove(RemoveArgs { .. })));
         let set = Cmd::parse_from(["llmapi", "set", "default", "deepseek"]);

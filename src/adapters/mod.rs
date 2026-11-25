@@ -5,7 +5,7 @@ pub mod openai_responses;
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use thiserror::Error;
 
 use super::model::{

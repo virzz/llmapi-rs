@@ -1,16 +1,16 @@
 use chrono::Utc;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 use super::super::{
     adapters::{
+        AdapterError, RequestAdapter, ResponseAdapter, SseEvent, StreamAdapter, StreamState,
         annotation_from_openai, annotation_to_openai, content_extensions_for, extensions_without,
-        message_extensions_for, validate_request_extras, value_as_extensions, AdapterError,
-        RequestAdapter, ResponseAdapter, SseEvent, StreamAdapter, StreamState,
+        message_extensions_for, validate_request_extras, value_as_extensions,
     },
     model::{
-        joined_text, Extensions, LLMChoice, LLMContent, LLMContentKind, LLMFinishReason,
-        LLMMediaSource, LLMMessage, LLMProtocol, LLMRequest, LLMResponse, LLMRole, LLMStreamEvent,
-        LLMTool, LLMToolChoice, LLMToolKind, LLMUsage,
+        Extensions, LLMChoice, LLMContent, LLMContentKind, LLMFinishReason, LLMMediaSource,
+        LLMMessage, LLMProtocol, LLMRequest, LLMResponse, LLMRole, LLMStreamEvent, LLMTool,
+        LLMToolChoice, LLMToolKind, LLMUsage, joined_text,
     },
 };
 
@@ -283,10 +283,12 @@ impl ResponseAdapter for OpenAiChatAdapter {
         }
         value.insert(
             "id".into(),
-            json!(response
-                .id
-                .clone()
-                .unwrap_or_else(|| format!("chatcmpl_{}", uuid::Uuid::new_v4()))),
+            json!(
+                response
+                    .id
+                    .clone()
+                    .unwrap_or_else(|| format!("chatcmpl_{}", uuid::Uuid::new_v4()))
+            ),
         );
         value.insert("object".into(), json!("chat.completion"));
         value.insert("created".into(), json!(Utc::now().timestamp()));
@@ -1464,9 +1466,11 @@ mod tests {
         );
         let normalized =
             OpenAiChatAdapter::parse_stream_event(&source, &mut StreamState::default()).unwrap();
-        assert!(normalized
-            .iter()
-            .any(|event| matches!(event, LLMStreamEvent::Raw { .. })));
+        assert!(
+            normalized
+                .iter()
+                .any(|event| matches!(event, LLMStreamEvent::Raw { .. }))
+        );
 
         assert!(matches!(
             AnthropicAdapter::format_stream_events(&normalized, &mut StreamState::default()),

@@ -5,8 +5,8 @@ use crate::config::Protocol;
 use axum::extract::ws::WebSocketUpgrade;
 use std::{
     sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -137,11 +137,13 @@ async fn model_allowlist_rejects_direct_requests_and_skips_ineligible_members() 
     for path in ["chat/completions", "messages"] {
         let response = post_chat(format!("http://{proxy}/a/{path}")).await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert!(response
-            .text()
-            .await
-            .unwrap()
-            .contains("model is not allowed"));
+        assert!(
+            response
+                .text()
+                .await
+                .unwrap()
+                .contains("model is not allowed")
+        );
     }
 
     let response = post_chat(format!("http://{proxy}/pool/chat/completions")).await;
@@ -940,10 +942,12 @@ async fn failover_can_commit_an_sse_response() {
 
     let response = post_chat(format!("http://{proxy}/chat/completions")).await;
     assert_eq!(response.status(), StatusCode::OK);
-    assert!(response.headers()["content-type"]
-        .to_str()
-        .unwrap()
-        .contains("text/event-stream"));
+    assert!(
+        response.headers()["content-type"]
+            .to_str()
+            .unwrap()
+            .contains("text/event-stream")
+    );
     let body = response.text().await.unwrap();
     assert!(body.contains("hi"), "{body}");
     assert!(body.contains("[DONE]"));
@@ -1099,7 +1103,7 @@ async fn llmapi_relay_supports_responses_websocket() {
 #[tokio::test]
 async fn websocket_enforces_the_allowlist_on_each_request() {
     use futures_util::{SinkExt, StreamExt};
-    use tokio_tungstenite::tungstenite::{protocol::frame::coding::CloseCode, Message};
+    use tokio_tungstenite::tungstenite::{Message, protocol::frame::coding::CloseCode};
 
     let upstream = serve(Router::new().route("/responses", any(ws_echo))).await;
     let mut config = config_with(&["a"], &[("a", &upstream, Protocol::OpenAiResponses)]);

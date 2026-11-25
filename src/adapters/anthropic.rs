@@ -1,10 +1,10 @@
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 use super::super::{
     adapters::{
+        AdapterError, RequestAdapter, ResponseAdapter, SseEvent, StreamAdapter, StreamState,
         annotation_from_anthropic, annotation_to_anthropic, content_extensions_for,
-        extensions_without, validate_request_extras, value_as_extensions, AdapterError,
-        RequestAdapter, ResponseAdapter, SseEvent, StreamAdapter, StreamState,
+        extensions_without, validate_request_extras, value_as_extensions,
     },
     model::{
         Extensions, LLMChoice, LLMContent, LLMContentKind, LLMFinishReason, LLMMediaSource,
@@ -257,10 +257,12 @@ impl ResponseAdapter for AnthropicAdapter {
         };
         value.insert(
             "id".into(),
-            json!(response
-                .id
-                .clone()
-                .unwrap_or_else(|| format!("msg_{}", uuid::Uuid::new_v4()))),
+            json!(
+                response
+                    .id
+                    .clone()
+                    .unwrap_or_else(|| format!("msg_{}", uuid::Uuid::new_v4()))
+            ),
         );
         value.insert("type".into(), json!("message"));
         value.insert("role".into(), json!("assistant"));
@@ -704,9 +706,10 @@ fn anthropic_content_to_value(content: &LLMContent) -> Result<Value, AdapterErro
             value.insert("type".into(), json!("tool_use"));
             value.insert(
                 "id".into(),
-                json!(id
-                    .clone()
-                    .unwrap_or_else(|| format!("toolu_{}", uuid::Uuid::new_v4()))),
+                json!(
+                    id.clone()
+                        .unwrap_or_else(|| format!("toolu_{}", uuid::Uuid::new_v4()))
+                ),
             );
             value.insert("name".into(), json!(name));
             value.insert("input".into(), normalize_tool_arguments(arguments));
@@ -724,11 +727,13 @@ fn anthropic_content_to_value(content: &LLMContent) -> Result<Value, AdapterErro
             {
                 value.insert(
                     "content".into(),
-                    json!(content
-                        .iter()
-                        .filter_map(LLMContent::text_value)
-                        .collect::<Vec<_>>()
-                        .join("")),
+                    json!(
+                        content
+                            .iter()
+                            .filter_map(LLMContent::text_value)
+                            .collect::<Vec<_>>()
+                            .join("")
+                    ),
                 );
             } else {
                 value.insert(

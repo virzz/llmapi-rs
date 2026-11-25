@@ -4,8 +4,8 @@ use std::{
     time::Duration,
 };
 
-use axum::http::{header, HeaderMap, HeaderValue};
-use serde_json::{json, Value};
+use axum::http::{HeaderMap, HeaderValue, header};
+use serde_json::{Value, json};
 use tokio::sync::watch;
 use tracing::warn;
 
@@ -330,14 +330,18 @@ mod tests {
         for field in ["max_output_tokens", "temperature", "top_p"] {
             assert!(request.get(field).is_none());
         }
-        assert!(request["include"]
-            .as_array()
-            .unwrap()
-            .contains(&json!("reasoning.encrypted_content")));
-        assert!(request["include"]
-            .as_array()
-            .unwrap()
-            .contains(&json!("web_search_call.action.sources")));
+        assert!(
+            request["include"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("reasoning.encrypted_content"))
+        );
+        assert!(
+            request["include"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("web_search_call.action.sources"))
+        );
         let mut simple = json!({"model": "gpt-5", "input": "hello"});
         prepare_request(&mut simple).unwrap();
         assert_eq!(simple["input"][0]["content"][0]["text"], "hello");

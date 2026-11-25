@@ -1,7 +1,7 @@
 use std::sync::OnceLock;
 
-use axum::http::{header, HeaderMap};
-use serde_json::{json, Map, Value};
+use axum::http::{HeaderMap, header};
+use serde_json::{Map, Value, json};
 
 pub fn is_codex_client(headers: &HeaderMap, query: Option<&str>) -> bool {
     query.is_some_and(|query| {
@@ -454,14 +454,16 @@ mod tests {
             custom["models"][0]["model_messages"]["instructions_template"],
             "Custom instructions"
         );
-        assert!(for_client(
-            json!({"data": [{"id": "deepseek-x", "effort": {"supported_levels": "low"}}]}),
-            true
-        )
-        .is_err());
+        assert!(
+            for_client(
+                json!({"data": [{"id": "deepseek-x", "effort": {"supported_levels": "low"}}]}),
+                true
+            )
+            .is_err()
+        );
         assert_eq!(
-            for_client(json!({"data": [{"id": "other", "name": "Other"}]}), true).unwrap()
-                ["models"][0]["display_name"],
+            for_client(json!({"data": [{"id": "other", "name": "Other"}]}), true).unwrap()["models"]
+                [0]["display_name"],
             "other"
         );
         let unknown = for_client(json!({"data": [{"id": "deepseek-new"}]}), true).unwrap();

@@ -7,11 +7,11 @@ use anyhow::{Context, Result};
 use chrono::NaiveDate;
 use comfy_table::Table;
 
-use axum::http::{header, Response};
+use axum::http::{Response, header};
 use futures_util::StreamExt;
 use serde::Deserialize;
 use serde_json::Value;
-use tokio::sync::{mpsc, Mutex, OnceCell};
+use tokio::sync::{Mutex, OnceCell, mpsc};
 
 use crate::{adapters::SseDecoder, proxy::MAX_JSON_BODY_BYTES};
 

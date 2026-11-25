@@ -7,13 +7,13 @@ use std::{
 
 use anyhow::Result;
 use axum::{
+    Json, Router,
     body::Body,
-    extract::{ws::WebSocketUpgrade, ConnectInfo, State},
+    extract::{ConnectInfo, State, ws::WebSocketUpgrade},
     http::{HeaderMap, Method, Request, Response, StatusCode, Uri},
     middleware::{self, Next},
     response::IntoResponse,
     routing::{any, get},
-    Json, Router,
 };
 use serde_json::json;
 use tokio::sync::{oneshot, watch};
@@ -471,14 +471,14 @@ mod tests {
     use std::{collections::BTreeMap, convert::Infallible, fs, path::Path, sync::Arc};
 
     use axum::{
+        Json, Router,
         body::Bytes,
         extract::State,
         http::{HeaderMap, Method, StatusCode},
         response::IntoResponse,
         routing::any,
-        Json, Router,
     };
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
     use tempfile::tempdir;
     use tokio::sync::Mutex;
 
@@ -1523,11 +1523,13 @@ mod tests {
                 .unwrap();
 
             assert_eq!(response.status(), StatusCode::OK, "{path}");
-            assert!(response
-                .headers()
-                .get_all("vary")
-                .iter()
-                .any(|value| value == "User-Agent"));
+            assert!(
+                response
+                    .headers()
+                    .get_all("vary")
+                    .iter()
+                    .any(|value| value == "User-Agent")
+            );
             let output: Value = response.json().await.unwrap();
             if codex {
                 assert!(output["models"].is_array(), "{path}");
@@ -1647,11 +1649,13 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
         assert_eq!(response.headers()["etag"], "\"catalog-v1\"");
-        assert!(response
-            .headers()
-            .get_all("vary")
-            .iter()
-            .any(|value| value == "User-Agent"));
+        assert!(
+            response
+                .headers()
+                .get_all("vary")
+                .iter()
+                .any(|value| value == "User-Agent")
+        );
     }
 
     #[tokio::test]
@@ -1731,10 +1735,12 @@ mod tests {
         let error: Value = response.json().await.unwrap();
         assert_eq!(error["type"], "error");
         assert_eq!(error["error"]["type"], "api_error");
-        assert!(error["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("audio"));
+        assert!(
+            error["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("audio")
+        );
     }
 
     #[tokio::test]
@@ -1756,10 +1762,12 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let error: Value = response.json().await.unwrap();
         assert_eq!(error["error"]["type"], "invalid_request_error");
-        assert!(error["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("field `n`"));
+        assert!(
+            error["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("field `n`")
+        );
         assert!(captured.lock().await.is_none());
     }
 
@@ -2007,10 +2015,12 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(reply.status(), StatusCode::BAD_REQUEST);
-            assert!(reply.json::<Value>().await.unwrap()["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains(field));
+            assert!(
+                reply.json::<Value>().await.unwrap()["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains(field)
+            );
         }
         assert!(captured.lock().await.is_none());
     }
@@ -2037,12 +2047,16 @@ mod tests {
         assert_eq!(response.headers()["content-type"], "text/event-stream");
         let body = response.text().await.unwrap();
         let events = sse_json_events(&body);
-        assert!(events
-            .iter()
-            .any(|event| event["choices"][0]["delta"]["content"] == "pong"));
-        assert!(events
-            .iter()
-            .any(|event| event["choices"][0]["finish_reason"] == "stop"));
+        assert!(
+            events
+                .iter()
+                .any(|event| event["choices"][0]["delta"]["content"] == "pong")
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event["choices"][0]["finish_reason"] == "stop")
+        );
         assert_eq!(events.last().unwrap()["usage"]["total_tokens"], 4);
         assert!(body.ends_with("data: [DONE]\n\n"));
         let request = captured.lock().await.clone().unwrap();

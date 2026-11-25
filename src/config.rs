@@ -654,7 +654,7 @@ impl ProviderConfigRaw {
                     _ => {
                         return Err(format!(
                             "provider type `{provider_type}` requires `baseurl`"
-                        ))
+                        ));
                     }
                 };
                 let protocol = Protocol::from_provider(provider_type)
@@ -970,9 +970,11 @@ providers:
                 assert_eq!(config.usage_db.path(), expected);
                 config.save(&path).unwrap();
                 assert_eq!(Config::load(&path).unwrap().usage_db.path(), expected);
-                assert!(!std::fs::read_to_string(&path)
-                    .unwrap()
-                    .contains(dir.path().to_str().unwrap()));
+                assert!(
+                    !std::fs::read_to_string(&path)
+                        .unwrap()
+                        .contains(dir.path().to_str().unwrap())
+                );
             }
         }
     }

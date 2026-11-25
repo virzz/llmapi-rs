@@ -1,16 +1,16 @@
 use chrono::Utc;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 use super::super::{
     adapters::{
+        AdapterError, RequestAdapter, ResponseAdapter, SseEvent, StreamAdapter, StreamState,
         annotation_from_openai, annotation_to_openai, content_extensions_for, extensions_without,
-        validate_request_extras, value_as_extensions, AdapterError, RequestAdapter,
-        ResponseAdapter, SseEvent, StreamAdapter, StreamState,
+        validate_request_extras, value_as_extensions,
     },
     model::{
-        joined_text, Extensions, LLMChoice, LLMContent, LLMContentKind, LLMFinishReason,
-        LLMMediaSource, LLMMessage, LLMProtocol, LLMRequest, LLMResponse, LLMRole, LLMStreamEvent,
-        LLMToolChoice, LLMUsage,
+        Extensions, LLMChoice, LLMContent, LLMContentKind, LLMFinishReason, LLMMediaSource,
+        LLMMessage, LLMProtocol, LLMRequest, LLMResponse, LLMRole, LLMStreamEvent, LLMToolChoice,
+        LLMUsage, joined_text,
     },
 };
 
@@ -251,10 +251,12 @@ impl ResponseAdapter for OpenAiResponsesAdapter {
         }
         value.insert(
             "id".into(),
-            json!(response
-                .id
-                .clone()
-                .unwrap_or_else(|| format!("resp_{}", uuid::Uuid::new_v4()))),
+            json!(
+                response
+                    .id
+                    .clone()
+                    .unwrap_or_else(|| format!("resp_{}", uuid::Uuid::new_v4()))
+            ),
         );
         value.insert("object".into(), json!("response"));
         value.insert("created_at".into(), json!(Utc::now().timestamp()));
@@ -1089,9 +1091,15 @@ fn responses_output_to_value(content: &[LLMContent]) -> Result<Vec<Value>, Adapt
             } if value["type"].is_string() => output.push(value.clone()),
             LLMContentKind::Raw { protocol, value } => {
                 let item_type = value["type"].as_str().unwrap_or("unknown");
-                return Err(AdapterError::Unsupported(format!("OpenAI Responses cannot represent {protocol:?} output item `{item_type}`")));
+                return Err(AdapterError::Unsupported(format!(
+                    "OpenAI Responses cannot represent {protocol:?} output item `{item_type}`"
+                )));
             }
-            LLMContentKind::ToolResult { .. } => return Err(AdapterError::Unsupported("Responses output cannot contain a tool result".into())),
+            LLMContentKind::ToolResult { .. } => {
+                return Err(AdapterError::Unsupported(
+                    "Responses output cannot contain a tool result".into(),
+                ));
+            }
             _ => visible.push(content.clone()),
         }
     }
@@ -1181,10 +1189,12 @@ fn reasoning_to_responses(content: &LLMContent) -> Value {
     value.insert("status".into(), json!("completed"));
     value.insert(
         "summary".into(),
-        json!(summary
-            .iter()
-            .map(|text| json!({"type": "summary_text", "text": text}))
-            .collect::<Vec<_>>()),
+        json!(
+            summary
+                .iter()
+                .map(|text| json!({"type": "summary_text", "text": text}))
+                .collect::<Vec<_>>()
+        ),
     );
     if let Some(text) = text {
         value.insert(
@@ -1453,7 +1463,7 @@ fn response_stream_item(content: &LLMContent, id: &str) -> Result<(String, Value
         LLMContentKind::ToolResult { .. } => {
             return Err(AdapterError::Unsupported(
                 "Responses output stream cannot contain tool results".into(),
-            ))
+            ));
         }
         _ => (
             "text".into(),

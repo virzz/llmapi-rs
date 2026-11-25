@@ -338,9 +338,11 @@ async fn codex_streams_native_events_and_converts_chat_and_messages() {
             "responses" => assert_eq!(body, stream),
             "chat/completions" => {
                 assert!(body.ends_with("data: [DONE]\n\n"));
-                assert!(events
-                    .iter()
-                    .any(|event| event["choices"][0]["delta"]["content"] == "hello"));
+                assert!(
+                    events
+                        .iter()
+                        .any(|event| event["choices"][0]["delta"]["content"] == "hello")
+                );
             }
             _ => {
                 assert_eq!(events.last().unwrap()["type"], "message_stop");
@@ -356,11 +358,13 @@ async fn codex_keeps_tool_calls_and_partial_output_when_aggregating() {
         "incomplete_details": {"reason": "max_output_tokens"},
         "output": [{"type": "function_call", "id": "fc-1", "call_id": "call-1", "name": "lookup", "arguments": "{\"q\":\"rust\"}"}],
         "usage": {"input_tokens": 3, "output_tokens": 2, "total_tokens": 5}});
-    let (upstream, _) = start_stream_upstream(vec![format!(
-        "data: {}\n\n",
-        json!({"type": "response.incomplete", "response": response})
-    )
-    .into_bytes()])
+    let (upstream, _) = start_stream_upstream(vec![
+        format!(
+            "data: {}\n\n",
+            json!({"type": "response.incomplete", "response": response})
+        )
+        .into_bytes(),
+    ])
     .await;
     let (_, auth) = watch::channel(Some(credentials()));
     let address = start_codex_proxy(codex_config(upstream), auth).await;

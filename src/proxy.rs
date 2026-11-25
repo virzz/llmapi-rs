@@ -1,19 +1,19 @@
 use axum::{
-    body::{to_bytes, Body},
-    extract::ws::{close_code, CloseFrame, Message as AxumMessage, WebSocket, WebSocketUpgrade},
-    http::{header, HeaderMap, HeaderValue, Method, Response, StatusCode},
+    body::{Body, to_bytes},
+    extract::ws::{CloseFrame, Message as AxumMessage, WebSocket, WebSocketUpgrade, close_code},
+    http::{HeaderMap, HeaderValue, Method, Response, StatusCode, header},
 };
 use bytes::{Bytes, BytesMut};
 use futures_util::{SinkExt, StreamExt};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tracing::{debug, error, info, warn};
 
 use super::{
     adapters::{
-        anthropic::AnthropicAdapter, gemini::GeminiAdapter, openai_chat::OpenAiChatAdapter,
-        openai_responses::OpenAiResponsesAdapter, AdapterError, RequestAdapter, ResponseAdapter,
-        SseDecoder, SseEvent, StreamAdapter, StreamState,
+        AdapterError, RequestAdapter, ResponseAdapter, SseDecoder, SseEvent, StreamAdapter,
+        StreamState, anthropic::AnthropicAdapter, gemini::GeminiAdapter,
+        openai_chat::OpenAiChatAdapter, openai_responses::OpenAiResponsesAdapter,
     },
     auth, codex,
     config::{Protocol, ProviderConfig, UpstreamConfig},
@@ -21,8 +21,8 @@ use super::{
     model::{LLMFinishReason, LLMRequest, LLMResponse, LLMStreamEvent},
     models,
     protocol::{
-        detect_route, interactions_endpoint, is_transparent, upstream_for_input, InputFormat,
-        InteractionsEndpoint, UpstreamFormat,
+        InputFormat, InteractionsEndpoint, UpstreamFormat, detect_route, interactions_endpoint,
+        is_transparent, upstream_for_input,
     },
     redact,
     server::AppState,
@@ -170,8 +170,9 @@ pub async fn handle_with_websocket(
         }
         let upstream = upstream.clone();
         let query = request.uri().query().map(ToString::to_string);
-        return websocket
-            .on_upgrade(move |socket| proxy_websocket(state, name, headers, upstream, query, socket));
+        return websocket.on_upgrade(move |socket| {
+            proxy_websocket(state, name, headers, upstream, query, socket)
+        });
     }
     let expected_method = if route.input == InputFormat::Models {
         Method::GET
@@ -467,8 +468,14 @@ async fn proxy_interactions(
     };
     match send_plan(state, &plan, None).await {
         Ok(upstream_response) => {
-            let response = if endpoint == InteractionsEndpoint::Create || plan.method == Method::GET {
-                crate::usage::observe_interaction(&state.usage, provider_name, &plan.body, upstream_response)
+            let response = if endpoint == InteractionsEndpoint::Create || plan.method == Method::GET
+            {
+                crate::usage::observe_interaction(
+                    &state.usage,
+                    provider_name,
+                    &plan.body,
+                    upstream_response,
+                )
             } else {
                 upstream_response
             };
@@ -683,7 +690,7 @@ async fn models_response_inner(
                 StatusCode::BAD_GATEWAY,
                 &err,
                 "api_error",
-            )
+            );
         }
     };
     let mut value: Value = match serde_json::from_slice(&body) {
@@ -694,7 +701,7 @@ async fn models_response_inner(
                 StatusCode::BAD_GATEWAY,
                 &err.to_string(),
                 "api_error",
-            )
+            );
         }
     };
     let (desired_key, other_key) = if codex_client {
@@ -739,7 +746,7 @@ async fn models_response_inner(
                 StatusCode::BAD_GATEWAY,
                 err,
                 "api_error",
-            )
+            );
         }
     };
     let mut response = response(
@@ -1155,7 +1162,7 @@ async fn attempt_member(
             return Attempt::Switch(format!(
                 "response header timeout after {}ms",
                 timeout.as_millis()
-            ))
+            ));
         }
         Err(SendError::Request(err)) => return Attempt::Switch(redact::transport_error(err)),
     };
