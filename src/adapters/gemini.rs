@@ -416,7 +416,7 @@ fn part_to_value(
                 call.insert("args".into(), arguments);
             }
             part["functionCall"] = json!(call);
-            if content.source == Some(LLMProtocol::OpenAiChat)
+            if matches!(content.source, Some(LLMProtocol::OpenAiChat | LLMProtocol::OpenAiResponses | LLMProtocol::AnthropicMessages))
                 && let Some(signature) = content
                     .metadata
                     .get("extra_content")
@@ -1175,11 +1175,7 @@ fn stream_part(
                 index,
                 id: None,
                 name: None,
-                arguments_delta: if content.metadata["functionCall"].get("args").is_some() {
-                    arguments.to_string()
-                } else {
-                    String::new()
-                },
+                arguments_delta: arguments.to_string(),
             })
         }
         _ => None,
@@ -1292,6 +1288,151 @@ mod tests {
         assert!(calls[1].get("id").is_none());
         assert!(calls[1]["function"].get("name").is_none());
         assert_eq!(calls[1]["function"]["arguments"], r#"{"id":2}"#);
+    }
+
+    #[test]
+    fn streams_omitted_tool_arguments_as_an_empty_object() {
+        let native = json!({"candidates":[{"content":{"parts":[{"functionCall":{"name":"ping"}}]},"finishReason":"STOP"}]});
+        let events = GeminiAdapter::parse_stream_event(
+            &SseEvent::json(None, &native),
+            &mut StreamState::default(),
+        )
+        .unwrap();
+        for chunks in [
+            OpenAiChatAdapter::format_stream_events(&events, &mut StreamState::default()).unwrap(),
+            OpenAiResponsesAdapter::format_stream_events(&events, &mut StreamState::default())
+                .unwrap(),
+        ] {
+            let args = chunks
+                .iter()
+                .filter_map(|chunk| {
+                    let value: Value = serde_json::from_str(&chunk.data).ok()?;
+                    if value["type"] == "response.function_call_arguments.delta" {
+                        value["delta"].as_str().map(str::to_owned)
+                    } else {
+                        value["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"]
+                            .as_str()
+                            .map(str::to_owned)
+                    }
+                })
+                .collect::<String>();
+            assert_eq!(serde_json::from_str::<Value>(&args).unwrap(), json!({}));
+        }
+        let chunks =
+            GeminiAdapter::format_stream_events(&events, &mut StreamState::default()).unwrap();
+        let first: Value = serde_json::from_str(&chunks[0].data).unwrap();
+        assert!(
+            first["candidates"][0]["content"]["parts"][0]["functionCall"]
+                .get("args")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn tool_signatures_round_trip_through_responses_and_messages() {
+        let native = json!({"candidates":[{"content":{"parts":[{
+            "functionCall":{"name":"lookup","args":{"q":"hi"}}, "thoughtSignature":"c2ln"
+        }]},"finishReason":"STOP"}]});
+        let response = GeminiAdapter::to_llm_response(native.clone()).unwrap();
+        let responses = OpenAiResponsesAdapter::from_llm_response(&response).unwrap();
+        let messages = AnthropicAdapter::from_llm_response(&response).unwrap();
+        let requests = [
+            OpenAiResponsesAdapter::to_llm_request(json!({"model":"gemini","input":responses["output"]})).unwrap(),
+            AnthropicAdapter::to_llm_request(json!({"model":"gemini","max_tokens":10,"messages":[{"role":"assistant","content":messages["content"]}]})).unwrap(),
+        ];
+        for request in requests {
+            let value = GeminiAdapter::from_llm_request(&request).unwrap();
+            assert_eq!(value["contents"][0]["parts"][0]["thoughtSignature"], "c2ln");
+        }
+
+        let events = GeminiAdapter::parse_stream_event(
+            &SseEvent::json(None, &native),
+            &mut StreamState::default(),
+        )
+        .unwrap();
+        let chunks =
+            OpenAiResponsesAdapter::format_stream_events(&events, &mut StreamState::default())
+                .unwrap();
+        let items = chunks
+            .iter()
+            .filter_map(|chunk| {
+                let value: Value = serde_json::from_str(&chunk.data).ok()?;
+                matches!(
+                    value["type"].as_str(),
+                    Some("response.output_item.added" | "response.output_item.done")
+                )
+                .then(|| value["item"].clone())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(items.len(), 2);
+        assert!(items[0]["call_id"].as_str().is_some());
+        assert_eq!(items[0]["call_id"], items[1]["call_id"]);
+        for item in &items {
+            assert_eq!(item["extra_content"]["google"]["thought_signature"], "c2ln");
+        }
+        let request =
+            OpenAiResponsesAdapter::to_llm_request(json!({"model":"gemini","input":[items[1]]}))
+                .unwrap();
+        assert_eq!(
+            GeminiAdapter::from_llm_request(&request).unwrap()["contents"][0]["parts"][0]
+                ["thoughtSignature"],
+            "c2ln"
+        );
+
+        let completed: Value = chunks
+            .iter()
+            .filter_map(|chunk| serde_json::from_str::<Value>(&chunk.data).ok())
+            .find(|value| value["type"] == "response.completed")
+            .unwrap();
+        assert_eq!(
+            completed["response"]["output"][0]["extra_content"]["google"]["thought_signature"],
+            "c2ln"
+        );
+        let mut parsed = StreamState::default();
+        let mut formatted = StreamState::default();
+        let output = chunks
+            .iter()
+            .flat_map(|chunk| {
+                let events =
+                    OpenAiResponsesAdapter::parse_stream_event(chunk, &mut parsed).unwrap();
+                GeminiAdapter::format_stream_events(&events, &mut formatted).unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert!(output
+            .iter()
+            .filter_map(|chunk| serde_json::from_str::<Value>(&chunk.data).ok())
+            .any(
+                |value| value["candidates"][0]["content"]["parts"][0]["thoughtSignature"] == "c2ln"
+            ));
+
+        let chunks =
+            AnthropicAdapter::format_stream_events(&events, &mut StreamState::default()).unwrap();
+        let block = chunks
+            .iter()
+            .find_map(|chunk| {
+                let value: Value = serde_json::from_str(&chunk.data).ok()?;
+                (value["type"] == "content_block_start").then(|| value["content_block"].clone())
+            })
+            .unwrap();
+        assert_eq!(
+            block["extra_content"]["google"]["thought_signature"],
+            "c2ln"
+        );
+        let mut parsed = StreamState::default();
+        let mut formatted = StreamState::default();
+        let output = chunks
+            .iter()
+            .flat_map(|chunk| {
+                let events = AnthropicAdapter::parse_stream_event(chunk, &mut parsed).unwrap();
+                GeminiAdapter::format_stream_events(&events, &mut formatted).unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert!(output
+            .iter()
+            .filter_map(|chunk| serde_json::from_str::<Value>(&chunk.data).ok())
+            .any(
+                |value| value["candidates"][0]["content"]["parts"][0]["thoughtSignature"] == "c2ln"
+            ));
     }
 
     #[test]

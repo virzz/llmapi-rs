@@ -185,6 +185,8 @@ llmapi usage --date-range 2026-11-01 2026-11-24
 
 ## Gemini upstream
 
+Gemini tool-call `thoughtSignature` values round-trip through `extra_content.google.thought_signature` on Chat, Responses, and Messages output items. Clients must preserve this extension when sending tool-call history back.
+
 ```toml
 [providers.gemini]
 type = "gemini"

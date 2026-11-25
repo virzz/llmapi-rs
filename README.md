@@ -122,6 +122,8 @@ llmapi usage --date-range 2026-11-01 2026-11-24
 
 ## Gemini 上游
 
+工具调用中的 Gemini `thoughtSignature` 通过 Chat、Responses 和 Messages 输出项上的 `extra_content.google.thought_signature` 往返传递。客户端回传工具调用历史时需保留该扩展字段。
+
 ```toml
 [providers.gemini]
 type = "gemini"

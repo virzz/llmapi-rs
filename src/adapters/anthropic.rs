@@ -786,7 +786,11 @@ fn anthropic_content_to_value(content: &LLMContent) -> Result<Value, AdapterErro
             )));
         }
     }
-    Ok(Value::Object(value))
+    let mut value = Value::Object(value);
+    if matches!(content.kind, LLMContentKind::ToolCall { .. }) {
+        super::add_tool_call_extra_content(&mut value, content);
+    }
+    Ok(value)
 }
 
 fn anthropic_messages_to_value(
@@ -981,12 +985,11 @@ fn anthropic_stream_content_start(content: &LLMContent) -> Result<Value, Adapter
         LLMContentKind::Text { .. } | LLMContentKind::Refusal { .. } => {
             json!({"type": "text", "text": ""})
         }
-        LLMContentKind::ToolCall { id, name, .. } => json!({
-            "type": "tool_use",
-            "id": id.clone().unwrap_or_else(|| format!("toolu_{}", uuid::Uuid::new_v4())),
-            "name": name,
-            "input": {}
-        }),
+        LLMContentKind::ToolCall { .. } => {
+            let mut value = anthropic_content_to_value(content)?;
+            value["input"] = json!({});
+            value
+        }
         LLMContentKind::Reasoning {
             encrypted_content: Some(data),
             ..

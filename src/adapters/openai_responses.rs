@@ -443,7 +443,12 @@ impl StreamAdapter for OpenAiResponsesAdapter {
                                 .unwrap_or_else(|| format!("call_{}", uuid::Uuid::new_v4())),
                         );
                     }
-                    let (kind, item) = response_stream_item(content, &item_id)?;
+                    let (kind, mut item) = response_stream_item(content, &item_id)?;
+                    if matches!(content.kind, LLMContentKind::ToolCall { .. }) {
+                        item["call_id"] = json!(state.tool_call_ids.get(&target));
+                        super::add_tool_call_extra_content(&mut item, content);
+                        state.pending_content.insert(target, content.clone());
+                    }
                     state.content_kinds.insert(target, kind.clone());
                     state.open_content.insert(target);
                     output.push(responses_stream_event(
@@ -593,7 +598,10 @@ impl StreamAdapter for OpenAiResponsesAdapter {
                             json!({"item_id": item_id, "output_index": target, "arguments": content}),
                         ));
                     }
-                    let item = completed_response_item(state, target, &item_id, &kind)?;
+                    let mut item = completed_response_item(state, target, &item_id, &kind)?;
+                    if let Some(content) = state.pending_content.remove(&target) {
+                        super::add_tool_call_extra_content(&mut item, &content);
+                    }
                     output.push(responses_stream_event(
                         state,
                         "response.output_item.done",
@@ -777,7 +785,11 @@ fn responses_input_to_value(
         let mut visible = Vec::new();
         for content in &message.content {
             match &content.kind {
-                LLMContentKind::ToolCall { id, name, arguments } => input.push(json!({"type": "function_call", "call_id": id.clone().unwrap_or_else(|| format!("call_{}", uuid::Uuid::new_v4())), "name": name, "arguments": super::openai_chat::arguments_to_string(arguments)})),
+                LLMContentKind::ToolCall { id, name, arguments } => {
+                    let mut item = json!({"type": "function_call", "call_id": id.clone().unwrap_or_else(|| format!("call_{}", uuid::Uuid::new_v4())), "name": name, "arguments": super::openai_chat::arguments_to_string(arguments)});
+                    super::add_tool_call_extra_content(&mut item, content);
+                    input.push(item);
+                }
                 LLMContentKind::ToolResult { tool_call_id, content, is_error } => input.push(json!({"type": "function_call_output", "call_id": tool_call_id, "output": responses_tool_output_to_value(content)?, "status": if *is_error == Some(true) { "failed" } else { "completed" }})),
                 LLMContentKind::Reasoning { .. } => input.push(reasoning_to_responses(content)),
                 LLMContentKind::Raw {
@@ -1061,7 +1073,15 @@ fn responses_output_to_value(content: &[LLMContent]) -> Result<Vec<Value>, Adapt
     let mut visible = Vec::new();
     for content in content {
         match &content.kind {
-            LLMContentKind::ToolCall { id, name, arguments } => output.push(json!({"id": format!("fc_{}", uuid::Uuid::new_v4()), "type": "function_call", "status": "completed", "call_id": id.clone().unwrap_or_else(|| format!("call_{}", uuid::Uuid::new_v4())), "name": name, "arguments": super::openai_chat::arguments_to_string(arguments)})),
+            LLMContentKind::ToolCall {
+                id,
+                name,
+                arguments,
+            } => {
+                let mut item = json!({"id": format!("fc_{}", uuid::Uuid::new_v4()), "type": "function_call", "status": "completed", "call_id": id.clone().unwrap_or_else(|| format!("call_{}", uuid::Uuid::new_v4())), "name": name, "arguments": super::openai_chat::arguments_to_string(arguments)});
+                super::add_tool_call_extra_content(&mut item, content);
+                output.push(item);
+            }
             LLMContentKind::Reasoning { .. } => output.push(reasoning_to_responses(content)),
             LLMContentKind::Raw {
                 protocol: LLMProtocol::OpenAiResponses,
@@ -1094,7 +1114,10 @@ fn responses_output_item_from_value(item: &Value) -> Result<Option<LLMContent>, 
                 name: item["name"].as_str().unwrap_or_default().to_string(),
                 arguments: json!({}),
             },
-            metadata: Extensions::new(),
+            metadata: extensions_without(
+                item,
+                &["type", "id", "call_id", "name", "arguments", "status"],
+            ),
         }),
         "reasoning" => Some(reasoning_from_responses(item)),
         "refusal" => Some(LLMContent {

@@ -467,6 +467,28 @@ pub(super) fn message_extensions_for(message: &LLMMessage, target: LLMProtocol) 
     }
 }
 
+pub(super) fn add_tool_call_extra_content(call: &mut Value, content: &LLMContent) {
+    match content.source {
+        Some(LLMProtocol::Gemini) => {
+            if let Some(signature) = content
+                .metadata
+                .get("thoughtSignature")
+                .and_then(Value::as_str)
+            {
+                call["extra_content"] = json!({"google": {"thought_signature": signature}});
+            }
+        }
+        Some(
+            LLMProtocol::OpenAiChat | LLMProtocol::OpenAiResponses | LLMProtocol::AnthropicMessages,
+        ) => {
+            if let Some(extra) = content.metadata.get("extra_content") {
+                call["extra_content"] = extra.clone();
+            }
+        }
+        _ => {}
+    }
+}
+
 pub(super) fn content_extensions_for(content: &LLMContent, target: LLMProtocol) -> Extensions {
     if content.source == Some(target) {
         content.metadata.clone()

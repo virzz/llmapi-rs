@@ -503,7 +503,7 @@ impl StreamAdapter for OpenAiChatAdapter {
                         if id.is_none() && content.source == Some(LLMProtocol::Gemini) {
                             call["id"] = json!(format!("call_{}", uuid::Uuid::new_v4()));
                         }
-                        add_tool_call_extra_content(&mut call, content);
+                        super::add_tool_call_extra_content(&mut call, content);
                         output.push(chat_stream_event(
                             state,
                             json!({"tool_calls": [call]}),
@@ -770,26 +770,6 @@ fn parse_chat_message(value: &Value) -> Result<LLMMessage, AdapterError> {
     })
 }
 
-fn add_tool_call_extra_content(call: &mut Value, content: &LLMContent) {
-    match content.source {
-        Some(LLMProtocol::Gemini) => {
-            if let Some(signature) = content
-                .metadata
-                .get("thoughtSignature")
-                .and_then(Value::as_str)
-            {
-                call["extra_content"] = json!({"google": {"thought_signature": signature}});
-            }
-        }
-        Some(LLMProtocol::OpenAiChat) => {
-            if let Some(extra) = content.metadata.get("extra_content") {
-                call["extra_content"] = extra.clone();
-            }
-        }
-        _ => {}
-    }
-}
-
 fn chat_message_to_value(message: &LLMMessage) -> Result<Value, AdapterError> {
     if message.role == LLMRole::Tool {
         let result = message
@@ -857,7 +837,7 @@ fn chat_message_to_value(message: &LLMMessage) -> Result<Value, AdapterError> {
                     "type": "function",
                     "function": {"name": name, "arguments": arguments_to_string(arguments)}
                 });
-                add_tool_call_extra_content(&mut call, content);
+                super::add_tool_call_extra_content(&mut call, content);
                 Some(call)
             }
             _ => None,
