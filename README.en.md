@@ -42,6 +42,7 @@ or `http://127.0.0.1:8080/openai/v1` to select `openai` explicitly. See the
 ## Commands
 
 ```bash
+llmapi version # also --version or -v; version comes from CARGO_PKG_VERSION
 llmapi list # aliases: ls, l
 llmapi usage [--name <provider>] [--date <YYYY-MM-DD> | --date-range <START> <END>]
 llmapi check [provider | --all | -a] [--model <model>] [--timeout <seconds>]

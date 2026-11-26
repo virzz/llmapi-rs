@@ -34,6 +34,7 @@ curl -H "Authorization: Bearer $LLMAPI_API_KEY" http://127.0.0.1:8080/providers
 ## 命令
 
 ```bash
+llmapi version # 也可使用 --version 或 -v；版本来自 CARGO_PKG_VERSION
 llmapi list # 别名 ls、l
 llmapi usage [--name <provider>] [--date <YYYY-MM-DD> | --date-range <START> <END>]
 llmapi check [provider | --all | -a] [--model <model>] [--timeout <seconds>]

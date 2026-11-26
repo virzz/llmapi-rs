@@ -35,8 +35,11 @@ use serde_json::{Value, json};
 use config::{Config, Protocol, Provider, ProviderConfig, UpstreamConfig};
 
 #[derive(Debug, Parser)]
-#[command(name = "llmapi")]
+#[command(name = "llmapi", version = env!("CARGO_PKG_VERSION"), disable_version_flag = true)]
 pub struct Cmd {
+    /// Print version
+    #[arg(short = 'v', long, action = clap::ArgAction::Version)]
+    version: Option<bool>,
     /// Config file path
     #[arg(short = 'c', long = "config", global = true)]
     config: Option<PathBuf>,
@@ -47,6 +50,8 @@ pub struct Cmd {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Print version
+    Version,
     /// Shell completion scripts
     #[clap(alias = "comp")]
     Completion {
@@ -498,6 +503,10 @@ impl Cmd {
 
     pub async fn execute(&self) -> Result<()> {
         match &self.command {
+            Command::Version => {
+                println!("llmapi {}", env!("CARGO_PKG_VERSION"));
+                Ok(())
+            }
             Command::Completion { shell } => {
                 let shell = shell.or_else(Shell::from_env).unwrap_or(Shell::Bash);
                 generate(shell, &mut Self::command(), "llmapi", &mut io::stdout());
